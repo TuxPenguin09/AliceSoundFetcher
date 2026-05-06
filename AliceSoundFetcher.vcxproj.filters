@@ -13,5 +13,13 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
+    <Filter Include="Source Files\Launcher">
+      <UniqueIdentifier>{4a32acf5-37fb-43c3-b742-b2ec12bedb1c}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="launcher\main.cpp">
+      <Filter>Source Files\Launcher</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>
