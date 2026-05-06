@@ -1,6 +1,8 @@
 #include "AFARead.h"
 #include <fstream>
 #include <iostream>
+#include <vector>
+#include <cstring>
 
 AFAFormat AFARead::detectFormat(const char* header) {
 	// AFAH
@@ -50,16 +52,8 @@ AFAArchive AFARead::parse(const fs::path& afaPath) {
 			break;
 	}
 
-	// Fetch file size
-	/*
-	file.seekg(0, std::ios::end);
-	uint64_t fileSize = file.tellg();
-	std::cout << "AFA Read: File size: " << fileSize << " bytes" << std::endl;
-	*/
-
 	// [DEV] Will become the real manifest extraction.
 	AFAEntry tmp;
-	//fake.name = afaPath.filename().string();
 	tmp.fileName = "__INDEX_PENDING__";
 	tmp.offset = 0;
 	tmp.size = 0;

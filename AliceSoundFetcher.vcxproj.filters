@@ -19,6 +19,12 @@
     <Filter Include="Source Files\Parser">
       <UniqueIdentifier>{437a0168-f044-48b3-af38-f8601d9a7e41}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\HookDDL">
+      <UniqueIdentifier>{0dc3cbb1-8318-4cd4-a619-6470989deb1d}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Source Files\Runtime">
+      <UniqueIdentifier>{ef015097-dcaf-4c27-b97d-adfadaa98ecb}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="launcher\main.cpp">
@@ -33,6 +39,15 @@
     <ClCompile Include="parser\AFARead.cpp">
       <Filter>Source Files\Parser</Filter>
     </ClCompile>
+    <ClCompile Include="hookdll\dllmain.cpp">
+      <Filter>Source Files\HookDDL</Filter>
+    </ClCompile>
+    <ClCompile Include="runtime\AudioTracker.cpp">
+      <Filter>Source Files\Runtime</Filter>
+    </ClCompile>
+    <ClCompile Include="hookdll\HookManager.cpp">
+      <Filter>Source Files\HookDDL</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="launcher\FileScan.h">
@@ -40,6 +55,12 @@
     </ClInclude>
     <ClInclude Include="parser\AFAFormat.h">
       <Filter>Source Files\Parser</Filter>
+    </ClInclude>
+    <ClInclude Include="runtime\AudioTracker.h">
+      <Filter>Source Files\Runtime</Filter>
+    </ClInclude>
+    <ClInclude Include="hookdll\HookManager.h">
+      <Filter>Source Files\HookDDL</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

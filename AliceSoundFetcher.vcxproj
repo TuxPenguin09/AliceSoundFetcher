@@ -105,10 +105,13 @@
       <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)\external\minhook\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalLibraryDirectories>$(SolutionDir)\external\minhook\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>libMinHook.x64.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -127,12 +130,15 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="hookdll\dllmain.cpp" />
+    <ClCompile Include="hookdll\HookManager.cpp" />
     <ClCompile Include="launcher\FileScan.cpp" />
     <ClCompile Include="launcher\main.cpp" />
     <ClCompile Include="parser\AFARead.cpp" />
     <ClCompile Include="parser\AFARead.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="hookdll\HookManager.h" />
     <ClInclude Include="launcher\FileScan.h" />
     <ClInclude Include="parser\AFAFormat.h" />
   </ItemGroup>
