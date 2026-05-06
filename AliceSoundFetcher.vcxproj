@@ -127,7 +127,11 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
+    <ClCompile Include="launcher\FileScan.cpp" />
     <ClCompile Include="launcher\main.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="launcher\FileScan.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

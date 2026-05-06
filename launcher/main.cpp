@@ -2,6 +2,8 @@
 #include <string>
 #include <filesystem>
 
+#include "FileScan.h"
+
 namespace fs = std::filesystem;
 
 void printBanner() {
@@ -34,10 +36,14 @@ int main(int argc, char* argv[]) {
 	}
 
 	std::cout << "Game selected: " << gamePath.string() << std::endl;
-	
 	fs::path gameDir = gamePath.parent_path();
 
 	std::cout << "Game directory: " << gameDir.string() << std::endl;
+
+	std::cout << "afa: Scanning for .afa..." << std::endl;
+	auto afaFiles = FileScan::findAFAFiles(gameDir);
+	FileScan::printFiles(afaFiles);
+	std::cout << "afa: Found " << afaFiles.size() << "\n" << std::endl;
 
 	return 0;
 }

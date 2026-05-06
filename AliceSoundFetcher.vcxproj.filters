@@ -21,5 +21,13 @@
     <ClCompile Include="launcher\main.cpp">
       <Filter>Source Files\Launcher</Filter>
     </ClCompile>
+    <ClCompile Include="launcher\FileScan.cpp">
+      <Filter>Source Files\Launcher</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="launcher\FileScan.h">
+      <Filter>Source Files\Launcher</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
