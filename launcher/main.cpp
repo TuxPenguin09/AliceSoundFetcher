@@ -3,6 +3,7 @@
 #include <filesystem>
 
 #include "FileScan.h"
+#include "../parser/AFARead.h"
 
 namespace fs = std::filesystem;
 
@@ -44,6 +45,13 @@ int main(int argc, char* argv[]) {
 	auto afaFiles = FileScan::findAFAFiles(gameDir);
 	FileScan::printFiles(afaFiles);
 	std::cout << "afa: Found " << afaFiles.size() << "\n" << std::endl;
+
+	std::cout << "afa: Indexing AFA archives..." << std::endl;
+	for (const auto& afaFile : afaFiles) {
+		AFAArchive archive = AFARead::parse(afaFile);
+
+		std::cout << "afa: Indexed " << archive.entries.size() << " entries from " << afaFile.filename().string() << "\n" << std::endl;
+	}
 
 	return 0;
 }

@@ -129,9 +129,12 @@
   <ItemGroup>
     <ClCompile Include="launcher\FileScan.cpp" />
     <ClCompile Include="launcher\main.cpp" />
+    <ClCompile Include="parser\AFARead.cpp" />
+    <ClCompile Include="parser\AFARead.h" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="launcher\FileScan.h" />
+    <ClInclude Include="parser\AFAFormat.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

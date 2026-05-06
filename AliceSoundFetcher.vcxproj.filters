@@ -16,6 +16,9 @@
     <Filter Include="Source Files\Launcher">
       <UniqueIdentifier>{4a32acf5-37fb-43c3-b742-b2ec12bedb1c}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Source Files\Parser">
+      <UniqueIdentifier>{437a0168-f044-48b3-af38-f8601d9a7e41}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="launcher\main.cpp">
@@ -24,10 +27,19 @@
     <ClCompile Include="launcher\FileScan.cpp">
       <Filter>Source Files\Launcher</Filter>
     </ClCompile>
+    <ClCompile Include="parser\AFARead.h">
+      <Filter>Source Files\Parser</Filter>
+    </ClCompile>
+    <ClCompile Include="parser\AFARead.cpp">
+      <Filter>Source Files\Parser</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="launcher\FileScan.h">
       <Filter>Source Files\Launcher</Filter>
+    </ClInclude>
+    <ClInclude Include="parser\AFAFormat.h">
+      <Filter>Source Files\Parser</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>
