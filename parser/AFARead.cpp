@@ -2,6 +2,20 @@
 #include <fstream>
 #include <iostream>
 
+AFAFormat AFARead::detectFormat(const char* header) {
+	// AFAH
+	if (header[0] == 'A' && header[1] == 'F' && header[2] == 'A' && header[3] == 'H') {
+		return AFAFormat::AFAH_STANDARD;
+	}
+
+	// AliceArch
+	if (std::memcmp(header + 8, "AlicArch", 8) == 0) {
+		return AFAFormat::ALICEARCH_EXTENDED;
+	}
+
+	return AFAFormat::UNKNOWN;
+}
+
 AFAArchive AFARead::parse(const fs::path& afaPath) {
 	AFAArchive archive;
 	archive.archPath = afaPath.string();
@@ -14,7 +28,7 @@ AFAArchive AFARead::parse(const fs::path& afaPath) {
 	}
 
 	// Reading the first 16 bytes for sign inspection
-	char header[16] = {};
+	char header[32] = {};
 	file.read(header, sizeof(header));
 
 	std::cout << "AFA Read: Parsing " << afaPath.filename().string() << std::endl;
@@ -24,18 +38,32 @@ AFAArchive AFARead::parse(const fs::path& afaPath) {
 	}
 	std::cout << std::endl;
 
+	switch (archive.format) {
+		case AFAFormat::AFAH_STANDARD:
+			std::cout << "AFA Read: AFAH Standard" << std::endl;
+			break;
+		case AFAFormat::ALICEARCH_EXTENDED:
+			std::cout << "AFA Read: AlicArch Extended" << std::endl;
+			break;
+		case AFAFormat::UNKNOWN:
+			std::cout << "AFA Read: Unknown format" << std::endl;
+			break;
+	}
+
 	// Fetch file size
+	/*
 	file.seekg(0, std::ios::end);
 	uint64_t fileSize = file.tellg();
 	std::cout << "AFA Read: File size: " << fileSize << " bytes" << std::endl;
+	*/
 
 	// [DEV] Will become the real manifest extraction.
-	AFAEntry fake;
-	fake.name = afaPath.filename().string();
-	fake.fileName = "__INDEX_PENDING__";
-	fake.offset = 0;
-	fake.size = fileSize;
-	archive.entries.push_back(fake);
+	AFAEntry tmp;
+	//fake.name = afaPath.filename().string();
+	tmp.fileName = "__INDEX_PENDING__";
+	tmp.offset = 0;
+	tmp.size = 0;
+	archive.entries.push_back(tmp);
 
 	return archive;
 }

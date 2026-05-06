@@ -8,4 +8,7 @@ namespace fs = std::filesystem;
 class AFARead {
 public:
 	static AFAArchive parse(const fs::path& afaPath);
+
+private:
+	static AFAFormat detectFormat(const char* header);
 };

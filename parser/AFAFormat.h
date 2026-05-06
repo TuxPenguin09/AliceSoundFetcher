@@ -4,8 +4,13 @@
 #include <vector>
 #include <cstdint>
 
+enum class AFAFormat {
+	AFAH_STANDARD,
+	ALICEARCH_EXTENDED,
+	UNKNOWN
+};
+
 struct AFAEntry {
-	std::string name;		// audio.afa
 	std::string fileName;	// ashdevilinanutshell.ogg
 	uint64_t offset;		// internal offset in archive
 	uint64_t size;			// size of the file, in bytes?
@@ -13,5 +18,6 @@ struct AFAEntry {
 
 struct AFAArchive {
 	std::string archPath;
+	AFAFormat format;
 	std::vector<AFAEntry> entries;
 };
