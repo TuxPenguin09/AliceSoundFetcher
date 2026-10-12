@@ -3,5 +3,8 @@
     <Platform Name="x64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="AliceSoundFetcher.vcxproj" />
+  <Project Path="AliceSoundFetcher.vcxproj" Id="21864061-0d3f-4382-a3ab-bf9ddfd9dde4">
+    <BuildDependency Project="AliceSoundFetcherDLL/AliceSoundFetcherDLL.vcxproj" />
+  </Project>
+  <Project Path="AliceSoundFetcherDLL/AliceSoundFetcherDLL.vcxproj" Id="0b6e55f9-fe26-4946-9953-f10bf601e888" />
 </Solution>

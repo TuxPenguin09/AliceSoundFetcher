@@ -14,3 +14,12 @@ This tool is intended for:
 - Learning Windows process injection and runtime monitoring techniques
 
 No game assets are redistributed by this project.
+
+## Licence
+
+Apache License 2.0 — see [`LICENSE.txt`](LICENSE.txt).
+
+Third-party software used during development is credited in
+[`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md), which also documents one
+compatibility point that matters: `alice-tools` is GPL-2.0 and is used purely
+as a verification oracle, never linked or vendored.

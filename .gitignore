@@ -364,3 +364,18 @@ FodyWeavers.xsd
 
 # External
 /external
+
+# Build
+/bin
+
+# MSBuild leaves behind a temporary project directory named after the former
+# project name plus a random suffix (AliceSou.21864061/). Regenerated on every
+# build, and only its Debug/ and x64/ subdirectories happen to be caught by the
+# patterns above.
+/AliceSou.*/
+
+# Crash dumps written by the exception diagnostics in runtime/AudioTracker.cpp.
+*.dmp
+
+# The live audio log is already covered by *.log above; it is written next to
+# the launcher (see ALICE_SOUNDFETCHER_LOG) and must never be committed.

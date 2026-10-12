@@ -70,6 +70,9 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <OutDir>$(SolutionDir)bin\$(Configuration)\</OutDir>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
     <ClCompile>
       <WarningLevel>Level3</WarningLevel>
@@ -77,10 +80,13 @@
       <PreprocessorDefinitions>WIN32;_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
+      <AdditionalIncludeDirectories>$(SolutionDir)\external\minhook\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>libMinHook.x86.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalLibraryDirectories>$(SolutionDir)\external\minhook\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Win32'">
@@ -130,17 +136,22 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="hookdll\dllmain.cpp" />
-    <ClCompile Include="hookdll\HookManager.cpp" />
     <ClCompile Include="launcher\FileScan.cpp" />
+    <ClCompile Include="launcher\Injector.cpp" />
     <ClCompile Include="launcher\main.cpp" />
     <ClCompile Include="parser\AFARead.cpp" />
     <ClCompile Include="parser\AFARead.h" />
+    <ClCompile Include="runtime\LogTailer.cpp" />
+
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="hookdll\HookManager.h" />
     <ClInclude Include="launcher\FileScan.h" />
+    <ClInclude Include="launcher\Injector.h" />
     <ClInclude Include="parser\AFAFormat.h" />
+    <ClInclude Include="parser\Inflate.h" />
+    <ClInclude Include="parser\AFAv3.h" />
+    <ClInclude Include="runtime\AudioTracker.h" />
+    <ClInclude Include="runtime\LogTailer.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
