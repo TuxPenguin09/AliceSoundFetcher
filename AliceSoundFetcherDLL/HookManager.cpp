@@ -2,7 +2,6 @@
 #include "HookManager.h"
 
 #include <windows.h>
-#include <MinHook.h>
 
 #include <cstdio>
 
@@ -32,9 +31,4 @@ void HookManager::init() {
 
 void HookManager::cleanup() {
 	AudioTracker::cleanup();
-
-	// MinHook is not used by the current tracker, but leave teardown correct if
-	// a future hook requires it.
-	MH_DisableHook(MH_ALL_HOOKS);
-	MH_Uninitialize();
 }

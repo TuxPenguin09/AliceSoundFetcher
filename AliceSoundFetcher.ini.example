@@ -1,0 +1,44 @@
+# AliceSoundFetcher settings
+#
+# Copy this to AliceSoundFetcher.ini beside AliceSoundFetcher.exe to use it.
+# The file is optional: with no file at all, the defaults below apply.
+# Comments start with # or ;. Values are 0/1, or true/false, yes/no, on/off.
+#
+# "AliceSoundFetcher.exe <game.exe> --verbose" overrides verbose for one run.
+
+# Log every hooked call, not just confirmed entry names.
+#
+# Off by default. The call stream runs to several thousand lines a session and
+# buries the one thing that matters. Turn this on when investigating a game
+# this tool does not yet know how to read.
+verbose = 0
+
+# Dump the first 256 bytes of sound objects and scan them for entry names.
+#
+# Off by default. The decoded sound object turns out not to retain the entry
+# name, so this no longer finds anything on its own -- but it is how that was
+# established, and it is the first thing to re-enable when a new game needs
+# looking at. Produces a lot of output.
+dumpObjects = 0
+
+# Hook the CRT string comparisons (strcmp and friends).
+#
+# Off by default. Evenicle imports no strcmp family at all, so this matches
+# nothing there. Kept because another game may import them, and because their
+# absence is what identified the engine's own comparison routine.
+hookComparisons = 0
+
+# Classes to hook, comma separated. Empty means the built-in list:
+#
+#   CSoundPlayer, CDirectSoundBuffer, CSoundDataOgg, CSoundDataWav,
+#   CKiwiSoundEngine
+#
+# Overriding this is how a single class can be tested without a rebuild.
+#
+# Classes available in this build's engine, which produced no entry names but
+# are useful when bisecting a crash:
+#
+#   CSoundFileAFA, CSoundFileList, CGroupTree, CSoundChannel,
+#   CSoundChannelList, CLowLevelChannelList, CHighLevelChannelList
+#
+# classes =

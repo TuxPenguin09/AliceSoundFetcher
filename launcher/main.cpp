@@ -72,21 +72,166 @@ int runTailMode(const fs::path& logPath) {
 	return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Optional settings file
+//
+// A plain key=value file read from beside the executable, so the diagnostic
+// knobs that matter day to day can be changed without a rebuild. Nothing here
+// changes what the tool fundamentally does.
+//
+//   # comment
+//   verbose = 1
+//   classes = CSoundPlayer,CDirectSoundBuffer
+//   dumpObjects = 0
+//   hookComparisons = 0
+//
+// A missing file, or a missing key, means "use the default".
+// ---------------------------------------------------------------------------
+
+struct Settings {
+	bool verbose = false;
+	bool dumpObjects = false;
+	bool hookComparisons = false;
+	std::string classes; // empty means the built-in list
+};
+
+namespace {
+
+fs::path settingsPath() {
+	wchar_t selfPath[MAX_PATH] = {};
+	if (!GetModuleFileNameW(nullptr, selfPath, MAX_PATH)) {
+		return fs::path();
+	}
+	return fs::path(selfPath).parent_path() / "AliceSoundFetcher.ini";
+}
+
+std::string trimText(const std::string& s) {
+	size_t begin = 0;
+	size_t end = s.size();
+	while (begin < end && (s[begin] == ' ' || s[begin] == '\t' || s[begin] == '\r')) {
+		++begin;
+	}
+	while (end > begin && (s[end - 1] == ' ' || s[end - 1] == '\t' || s[end - 1] == '\r')) {
+		--end;
+	}
+	return s.substr(begin, end - begin);
+}
+
+bool parseBool(const std::string& value, bool fallback) {
+	const std::string v = trimText(value);
+	if (v == "1" || v == "true" || v == "yes" || v == "on") {
+		return true;
+	}
+	if (v == "0" || v == "false" || v == "no" || v == "off") {
+		return false;
+	}
+	return fallback;
+}
+
+} // namespace
+
+Settings loadSettings() {
+	Settings settings;
+
+	std::ifstream file(settingsPath());
+	if (!file) {
+		return settings; // no file is normal; defaults are what most users want
+	}
+
+	std::string line;
+	while (std::getline(file, line)) {
+		const size_t comment = line.find_first_of("#;");
+		if (comment != std::string::npos) {
+			line = line.substr(0, comment);
+		}
+		line = trimText(line);
+		if (line.empty()) {
+			continue;
+		}
+
+		const size_t equals = line.find('=');
+		if (equals == std::string::npos) {
+			continue;
+		}
+
+		std::string key = trimText(line.substr(0, equals));
+		const std::string value = trimText(line.substr(equals + 1));
+
+		// Tolerate a UTF-8 byte order mark.
+		//
+		// Notepad on Windows writes one by default, so an .ini saved from it is
+		// the single most likely way for a user to produce a file. Without this the
+		// first key is read as "\xEF\xBB\xBFverbose", matches nothing, and the
+		// setting is ignored with no indication that anything went wrong.
+		if (key.size() >= 3 &&
+			(unsigned char)key[0] == 0xEF &&
+			(unsigned char)key[1] == 0xBB &&
+			(unsigned char)key[2] == 0xBF) {
+			key.erase(0, 3);
+		}
+
+		if (key == "verbose") {
+			settings.verbose = parseBool(value, settings.verbose);
+		} else if (key == "dumpObjects") {
+			settings.dumpObjects = parseBool(value, settings.dumpObjects);
+		} else if (key == "hookComparisons") {
+			settings.hookComparisons = parseBool(value, settings.hookComparisons);
+		} else if (key == "classes") {
+			settings.classes = value;
+		} else {
+			// An unrecognised key is more likely a typo than a deliberate extra
+			// setting, and a typo that is ignored in silence is exactly the kind of
+			// thing that sends someone looking for a bug that is not there.
+			std::cout << "config: ignoring unknown setting \"" << key
+				<< "\" in " << settingsPath().filename().string() << std::endl;
+		}
+	}
+
+	if (settings.verbose) {
+		std::cout << "config: verbose logging enabled" << std::endl;
+	}
+
+	return settings;
+}
+
 int main(int argc, char* argv[]) {
 	// Tail mode takes no banner: the window is the log view itself.
 	if (argc >= 3 && std::string(argv[1]) == "--tail") {
 		return runTailMode(fs::path(argv[2]));
 	}
 
+	// Settings are read first so an explicit --verbose can override the file.
+	Settings settings = loadSettings();
+
+	std::string gameArgument;
+	bool verboseFlag = false;
+	for (int i = 1; i < argc; ++i) {
+		const std::string arg = argv[i];
+		if (arg == "--verbose" || arg == "-v") {
+			verboseFlag = true;
+		} else if (arg == "--help" || arg == "-h") {
+			std::cout << "Usage: " << argv[0] << " <game.exe> [--verbose]" << std::endl
+				<< "       " << argv[0] << " --tail <logfile>" << std::endl
+				<< std::endl
+				<< "Settings may be placed in AliceSoundFetcher.ini beside this program." << std::endl;
+			return 0;
+		} else if (gameArgument.empty()) {
+			gameArgument = arg;
+		}
+	}
+	if (verboseFlag) {
+		settings.verbose = true;
+	}
+
 	printBanner();
 
-	if (argc < 2) {
+	if (gameArgument.empty()) {
 		std::cerr << "Usage: " << argv[0] << " <path_to_exe> " << "or drag an AliceSoft System game onto this program." << std::endl;
 		std::cerr << "Error: No executable file provided." << std::endl;
 		return 1;
 	}
 
-	fs::path gamePath = argv[1];
+	fs::path gamePath = gameArgument;
 
 	if (!fs::exists(gamePath)) {
 		std::cerr << "Error: The specified file does not exist." << std::endl;
@@ -146,6 +291,22 @@ int main(int argc, char* argv[]) {
 	// below mirrors them, so the env var is how the two processes agree on it.
 	const fs::path logPath = fs::path(selfPath).parent_path() / "AliceSoundFetcher.log";
 	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_LOG", logPath.c_str());
+
+	// Hand the resolved settings to the injected DLL. The launcher reads the file
+	// rather than the DLL doing it: the DLL is already the busiest thing in the
+	// process, and this keeps its start-up work to a few environment lookups.
+	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_VERBOSE",
+		settings.verbose ? L"1" : L"0");
+	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_DUMPOBJECTS",
+		settings.dumpObjects ? L"1" : L"0");
+	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_COMPARES",
+		settings.hookComparisons ? L"1" : L"0");
+	if (!settings.classes.empty()) {
+		const std::wstring wide(settings.classes.begin(), settings.classes.end());
+		SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_CLASSES", wide.c_str());
+		std::cout << "config: hooking only the classes listed in the settings file"
+			<< std::endl;
+	}
 
 	// Hand the entry names to the DLL.
 	//

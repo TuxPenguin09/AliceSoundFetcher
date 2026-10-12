@@ -18,6 +18,33 @@ This tool is intended for:
 
 No game assets are redistributed by this project.
 
+## Usage
+
+Drag an AliceSoft System game executable onto `AliceSoundFetcher.exe`. It reads the
+game's `.afa` archives, injects a tracking DLL, and writes confirmed archive entry
+names to `AliceSoundFetcher.log`, which is mirrored live in a separate window that
+stays open after the game exits.
+
+```
+AliceSoundFetcher.exe <game.exe>            # normal run
+AliceSoundFetcher.exe <game.exe> --verbose  # also log every hooked call
+AliceSoundFetcher.exe --tail <logfile>      # viewer window only
+```
+
+### Settings
+
+Optional, read from `AliceSoundFetcher.ini` beside the executable. With no file at
+all, the defaults apply. See [`AliceSoundFetcher.ini.example`](AliceSoundFetcher.ini.example).
+
+| Setting | Default | Effect |
+| --- | --- | --- |
+| `verbose` | `0` | Log every hooked call, not just confirmed names |
+| `dumpObjects` | `0` | Dump sound-object memory and scan it for entry names |
+| `hookComparisons` | `0` | Hook the CRT `strcmp` family |
+| `classes` | built-in list | Comma-separated classes to hook |
+
+`--verbose` overrides the file for one run.
+
 ## Licence
 
 Apache License 2.0 — see [`LICENSE.txt`](LICENSE.txt).

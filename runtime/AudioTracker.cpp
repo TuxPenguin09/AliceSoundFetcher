@@ -112,20 +112,46 @@ namespace {
 		// Serialise writers so two game threads cannot interleave partial lines.
 		AcquireSRWLockExclusive(&g_logLock);
 
+		// Exactly one CRLF per line, whatever the caller supplied.
+		//
+		// This used to rewrite every '\n' as "\r\n" and then append another "\r\n"
+		// unconditionally, while the callers had already put a "\r\n" on the end of
+		// their own text. Every entry therefore reached the file as "\r\r\n\r\n"
+		// and showed up as a blank line in the middle of the log -- around 390 of
+		// them in a short session, which is a large share of why the output was
+		// hard to read.
+		//
+		// So: drop whatever terminator the caller used, discard CR entirely, turn
+		// each remaining LF into CRLF, and finish with one CRLF.
+		size_t length = strlen(line);
+		while (length > 0 && (line[length - 1] == '\r' || line[length - 1] == '\n')) {
+			--length;
+		}
+
 		std::string buffer;
-		buffer.reserve(strlen(line) + 2);
-		for (const char* p = line; *p; ++p) {
-			if (*p == '\n') {
-				buffer += '\r';
+		buffer.reserve(length + 2);
+		for (size_t i = 0; i < length; ++i) {
+			if (line[i] == '\r') {
+				continue;
 			}
-			buffer += *p;
+			if (line[i] == '\n') {
+				buffer += '\r';
+				buffer += '\n';
+			} else {
+				buffer += line[i];
+			}
 		}
 		buffer += '\r';
 		buffer += '\n';
 
 		DWORD written = 0;
 		WriteFile(g_logFile, buffer.data(), (DWORD)buffer.size(), &written, nullptr);
-		FlushFileBuffers(g_logFile);
+
+		// No FlushFileBuffers here. WriteFile has already put the bytes where the
+		// tailer process can read them -- that is the only other reader, and it
+		// shares the file. Forcing them down to the physical disk on every single
+		// hooked call costs far more than the log is worth, and the call volume is
+		// thousands of lines a session.
 		OutputDebugStringA(line);
 
 		ReleaseSRWLockExclusive(&g_logLock);
@@ -330,28 +356,19 @@ namespace {
 	// The audio classes to hook. Every one is attempted; a missing class is
 	// reported and skipped rather than treated as an error, because the exact set
 	// differs per game.
+	// The classes that are worth hooking by default.
+	//
+	// A wider net was tried -- CSoundFileAFA, CSoundFileList, CGroupTree and the
+	// channel lists were all hooked while hunting for the entry name. None of them
+	// ever produced a name, and each one added call volume to a log that was
+	// already unreadable, so they are opt-in via `classes` in the settings file
+	// rather than on by default. The archive side is reached through
+	// std::string::assign instead, which needs no class hooks at all.
 	const char* const kAudioClasses[] = {
-		// The playback path proper.
 		"CSoundPlayer",
 		"CDirectSoundBuffer",
-
-		// The archive side. CSoundFileAFA resolves a member of an .afa archive to
-		// audio data, so it is where an entry name is actually present -- the
-		// decoded sound object does not retain it, which is why dumping
-		// CSoundDataOgg never turned up a name.
-		"CSoundFileAFA",
-		"CSoundFileList",
-
-		// Decoded data.
 		"CSoundDataOgg",
 		"CSoundDataWav",
-
-		// Routing and grouping; these tend to hold the key that started playback.
-		"CGroupTree",
-		"CSoundChannel",
-		"CSoundChannelList",
-		"CLowLevelChannelList",
-		"CHighLevelChannelList",
 		"CKiwiSoundEngine",
 	};
 	constexpr int kAudioClassCount = (int)(sizeof(kAudioClasses) / sizeof(kAudioClasses[0]));
@@ -371,6 +388,22 @@ namespace {
 
 	// Quiet mode: count only, never format or write. See AudioTrackerLogHook.
 	bool g_quiet = false;
+
+	// Verbose: also log every hooked call. Off by default, because the call
+	// stream runs to thousands of lines a session and buried the one thing that
+	// matters -- a confirmed archive entry name.
+	bool g_verbose = false;
+
+	// Object memory dumps and near-miss strings. Pure diagnosis; the decoded
+	// sound object does not carry the entry name, so these stopped producing
+	// anything useful once std::string::assign was hooked.
+	bool g_dumpObjects = false;
+
+	// Hook the CRT string comparisons. Off by default: Evenicle imports no strcmp
+	// family at all, so this matches nothing there. Left in because another game
+	// might import them, and because the fact that it finds nothing is what
+	// identified 0x00460509 as the real comparison path.
+	bool g_hookComparisons = false;
 
 	// Passthrough mode: each stub is nothing but a jump to the original entry, so
 	// the vtable is patched exactly as before but nothing of ours ever executes.
@@ -422,7 +455,15 @@ namespace {
 	// Set while deliberately probing possibly-invalid pointers, so the vectored
 	// exception handler does not report the resulting access violations as if
 	// they were faults in the game or in our stubs.
-	LONG g_probing = 0;
+	// Nesting depth of deliberate probing, not a boolean.
+//
+// The hooks run on whichever game thread happens to be in an audio call, and
+// several of them probe at once. As a plain flag this was wrong under
+// concurrency: thread A would finish and clear it while thread B was still
+// reading an unguarded address, so B's caught access violation reached the
+// vectored handler as if it were a real fault. Counting instead means the last
+// probe out is the one that turns reporting back on.
+LONG g_probing = 0;
 
 	// Object pointers already dumped, so each instance is reported once rather
 	// than on every call that mentions it. Claimed with an interlocked compare
@@ -477,9 +518,9 @@ namespace {
 		}
 
 		uint32_t vptr = 0;
-		InterlockedExchange(&g_probing, 1);
+		InterlockedIncrement(&g_probing);
 		const bool ok = safeRead32(candidate, &vptr);
-		InterlockedExchange(&g_probing, 0);
+		InterlockedDecrement(&g_probing);
 		if (!ok) {
 			return nullptr;
 		}
@@ -570,8 +611,20 @@ void logLoadedModules() {
 // DllMain, i.e. before the game's own start-up code has executed, so at that
 // point nothing but the core system libraries are loaded and the list says
 // nothing useful about where the engine's plugin code actually lives.
+//
+// This answered one question -- whether the engine's plugins are separate DLLs
+// or built into the executable -- and the answer was "built in": all 95 modules
+// on a stock Windows machine are system, driver or overlay DLLs, and the
+// registry strings for AFALoader and KiwiSoundEngine resolve to code inside
+// Evenicle.exe. It is kept for the next game this is pointed at, where the
+// answer may well differ, but it is verbose-only: on this game it costs 95
+// lines of graphics-driver noise in every run and finds nothing.
 void moduleSnapshotThread() {
 	Sleep(8000);
+
+	if (!g_verbose) {
+		return;
+	}
 
 	logInfo("AudioTracker: module list 8s after start-up:");
 	logLoadedModules();
@@ -702,6 +755,41 @@ int shiftJisRunLength(const uint8_t* p, int max);
 int safeShiftJisRunLength(uintptr_t address, char* out, int max);
 void escapeToLog(char* out, size_t outCap, const uint8_t* p, int len);
 
+// Confirmed entry names, reported once each.
+//
+// Every name this tool prints goes through here: the name comes from the string
+// comparison hooks, from the archive-load hook, and from the argument scan in the
+// playback stub, and a single name is normally seen many times -- one that is
+// looked up per frame would otherwise fill the log with thousands of identical
+// lines and bury everything else. Deduplicating in one place is what keeps a long
+// play session readable.
+//
+// Repeats are counted but not logged again. A summary of the counts at shutdown
+// would be the obvious next step, and is deliberately not here: the game process
+// exits through DLL_PROCESS_DETACH, and doing file I/O from that callback is a
+// good way to turn a clean exit into a hang. The counts are recorded here
+// whenever a caller wants to report them from a safer point.
+std::vector<std::string> g_reportedNames;
+std::vector<int> g_reportedNameCounts;
+
+void reportConfirmedName(const char* prefix, const uint8_t* bytes, int length,
+	const std::string& archive) {
+	char text[1024];
+	escapeToLog(text, sizeof(text), bytes, length);
+
+	const std::string key = std::string(prefix) + "|" + archive + "|" + text;
+	for (size_t i = 0; i < g_reportedNames.size(); ++i) {
+		if (g_reportedNames[i] == key) {
+			++g_reportedNameCounts[i];
+			return;
+		}
+	}
+
+	g_reportedNames.push_back(key);
+	g_reportedNameCounts.push_back(1);
+	logInfo("%s name=\"%s\" [%s]", prefix, text, archive.c_str());
+}
+
 using CompareFn = int(__cdecl*)(const char*, const char*);
 
 CompareFn g_compareOriginals[kMaxCompareHooks] = {};
@@ -711,7 +799,12 @@ int g_compareHookCount = 0;
 //
 // Only ever called with a pointer that came out of the game's own data, so the
 // read is guarded and the probing flag is raised while it happens.
-void reportCompareArgument(const char* value, const char* where, int slot) {
+//
+// Neither side of the comparison is attributed to a caller any more: the whole
+// point of these hooks was to find the name, and a confirmed name is now logged
+// once wherever it is first seen rather than with the site that happened to see
+// it first.
+void reportCompareArgument(const char* value) {
 	if (!value || !g_indexLoaded) {
 		return;
 	}
@@ -721,42 +814,38 @@ void reportCompareArgument(const char* value, const char* where, int slot) {
 	}
 
 	char raw[512];
-	InterlockedExchange(&g_probing, 1);
+	InterlockedIncrement(&g_probing);
 	const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
-	InterlockedExchange(&g_probing, 0);
+	InterlockedDecrement(&g_probing);
 
 	if (len < 3) {
 		return;
 	}
 
 	std::string archive;
-	if (!lookupEntryName((const uint8_t*)raw, len, archive)) {
-		return;
+	if (lookupEntryName((const uint8_t*)raw, len, archive)) {
+		reportConfirmedName("MATCH", (const uint8_t*)raw, len, archive);
 	}
-
-	char text[1024];
-	escapeToLog(text, sizeof(text), (const uint8_t*)raw, len);
-	logInfo("MATCH %s slot=%d name=\"%s\" [%s]", where, slot, text, archive.c_str());
 }
 
 int __cdecl hookedCompare0(const char* a, const char* b) {
-	reportCompareArgument(a, "cmp0", 0);
-	reportCompareArgument(b, "cmp0", 1);
+	reportCompareArgument(a);
+	reportCompareArgument(b);
 	return g_compareOriginals[0](a, b);
 }
 int __cdecl hookedCompare1(const char* a, const char* b) {
-	reportCompareArgument(a, "cmp1", 0);
-	reportCompareArgument(b, "cmp1", 1);
+	reportCompareArgument(a);
+	reportCompareArgument(b);
 	return g_compareOriginals[1](a, b);
 }
 int __cdecl hookedCompare2(const char* a, const char* b) {
-	reportCompareArgument(a, "cmp2", 0);
-	reportCompareArgument(b, "cmp2", 1);
+	reportCompareArgument(a);
+	reportCompareArgument(b);
 	return g_compareOriginals[2](a, b);
 }
 int __cdecl hookedCompare3(const char* a, const char* b) {
-	reportCompareArgument(a, "cmp3", 0);
-	reportCompareArgument(b, "cmp3", 1);
+	reportCompareArgument(a);
+	reportCompareArgument(b);
 	return g_compareOriginals[3](a, b);
 }
 
@@ -883,16 +972,14 @@ void __cdecl onAssignString(const char* source) {
 		const uintptr_t candidate = (uintptr_t)source;
 		if (candidate >= 0x10000 && candidate <= 0x7FFEFFFF) {
 			char raw[512];
-			InterlockedExchange(&g_probing, 1);
+			InterlockedIncrement(&g_probing);
 			const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
-			InterlockedExchange(&g_probing, 0);
+			InterlockedDecrement(&g_probing);
 
 			if (len >= 3) {
 				std::string archive;
 				if (lookupEntryName((const uint8_t*)raw, len, archive)) {
-					char text[1024];
-					escapeToLog(text, sizeof(text), (const uint8_t*)raw, len);
-					logInfo("MATCH assign name=\"%s\" [%s]", text, archive.c_str());
+					reportConfirmedName("MATCH", (const uint8_t*)raw, len, archive);
 				}
 			}
 		}
@@ -1238,7 +1325,17 @@ void installAssignStringHook() {
 			return result;
 		}
 
-		std::string all(buffer, buffer + copied);
+		// Narrow explicitly. `std::string all(buffer, buffer + copied)` would
+		// pick the wchar_t iterator constructor and silently truncate every
+		// character on the way in; class names are ASCII, so the loop is exact,
+		// but anything else would be quietly mangled into a name that hooks
+		// nothing.
+		std::string all;
+		all.reserve(copied);
+		for (DWORD i = 0; i < copied && buffer[i] < 0x80; ++i) {
+			all.push_back((char)buffer[i]);
+		}
+
 		size_t start = 0;
 		while (start <= all.size()) {
 			const size_t comma = all.find(',', start);
@@ -1367,7 +1464,7 @@ namespace {
 		// Access violations raised on purpose while probing candidate argument
 		// pointers are expected and must not be reported as faults; otherwise
 		// routine probing buries the real ones.
-		if (g_probing) {
+		if (g_probing > 0) {
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
@@ -1471,27 +1568,35 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 
 	// Classify the incoming arguments before formatting, so the event line shows
 	// what the values actually are rather than leaving that to interpretation.
-	const std::string* sp0Class = identifyObject((uintptr_t)sp0);
-	const std::string* sp1Class = identifyObject((uintptr_t)sp1);
+	// Only done when the call stream is actually being written; in the default
+	// mode this runs thousands of times a session for nothing.
+	// Only done when the results are actually going to be used. In the default
+	// mode neither the call stream nor the object dumps are written, and this
+	// runs thousands of times a session.
+	const bool needArgClasses = g_verbose || g_dumpObjects;
+	const std::string* sp0Class = needArgClasses ? identifyObject((uintptr_t)sp0) : nullptr;
+	const std::string* sp1Class = needArgClasses ? identifyObject((uintptr_t)sp1) : nullptr;
 
-	char line[320];
-	int written;
-	if (sp0Class || sp1Class) {
-		written = snprintf(line, sizeof(line),
-			"%s CALL %s slot=%d this=%p sp0=%s(%p) sp1=%s(%p)\r\n",
-			stamp, target.className.c_str(), target.slot, self,
-			sp0Class ? sp0Class->c_str() : "?", sp0,
-			sp1Class ? sp1Class->c_str() : "?", sp1);
-	} else {
-		written = snprintf(line, sizeof(line),
-			"%s CALL %s slot=%d this=%p sp0=%p sp1=%p\r\n",
-			stamp, target.className.c_str(), target.slot, self, sp0, sp1);
+	// The call stream is diagnostics, not the result. It runs to thousands of
+	// lines a session and buries the confirmed names, so it is verbose-only.
+	if (g_verbose) {
+		char line[320];
+		int written;
+		if (sp0Class || sp1Class) {
+			written = snprintf(line, sizeof(line),
+				"%s CALL %s slot=%d this=%p sp0=%s(%p) sp1=%s(%p)\r\n",
+				stamp, target.className.c_str(), target.slot, self,
+				sp0Class ? sp0Class->c_str() : "?", sp0,
+				sp1Class ? sp1Class->c_str() : "?", sp1);
+		} else {
+			written = snprintf(line, sizeof(line),
+				"%s CALL %s slot=%d this=%p sp0=%p sp1=%p\r\n",
+				stamp, target.className.c_str(), target.slot, self, sp0, sp1);
+		}
+		if (written > 0) {
+			AudioTrackerInternals::write(line);
+		}
 	}
-	if (written <= 0) {
-		return;
-	}
-
-	AudioTrackerInternals::write(line);
 
 	// A sound data object is what we ultimately care about, so dump its memory
 	// once per instance. The layout is deliberately *not* assumed here: reading
@@ -1512,18 +1617,13 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 			}
 
 			char raw[512];
-			InterlockedExchange(&g_probing, 1);
+			InterlockedIncrement(&g_probing);
 
 			const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
 			if (len >= 3) {
 				std::string archive;
-				char text[1024];
-
-				// Exact match first: the engine may pass the bare member name.
 				if (lookupEntryName((const uint8_t*)raw, len, archive)) {
-					escapeToLog(text, sizeof(text), (const uint8_t*)raw, len);
-					logInfo("PLAY %s slot=%d arg%d name=\"%s\" [%s]",
-						target.className.c_str(), target.slot, a, text, archive.c_str());
+					reportConfirmedName("PLAY", (const uint8_t*)raw, len, archive);
 				}
 				else {
 					// Otherwise the name may be the tail of a path such as
@@ -1538,18 +1638,22 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 						const uint8_t* tail = (const uint8_t*)raw + lastSlash + 1;
 						const int tailLen = len - lastSlash - 1;
 						if (tailLen >= 3 && lookupEntryName(tail, tailLen, archive)) {
-							escapeToLog(text, sizeof(text), tail, tailLen);
-							logInfo("PLAY %s slot=%d arg%d name=\"%s\" [%s]",
-								target.className.c_str(), target.slot, a,
-								text, archive.c_str());
+							reportConfirmedName("PLAY", tail, tailLen, archive);
 						}
 					}
 				}
 			}
 
-			InterlockedExchange(&g_probing, 0);
+			InterlockedDecrement(&g_probing);
 		}
 	}
+	// Object memory dumps are diagnosis only, and by far the largest thing the
+	// hook used to produce. The decoded sound object turned out not to carry the
+	// entry name at all, so this is off unless explicitly asked for.
+	if (!g_dumpObjects) {
+		return;
+	}
+
 	// The object of interest is usually `this` rather than an argument -- a call
 	// like CSoundDataOgg::SomeMethod() *is* operating on the sound object. The
 	// arguments are still checked, because a sound object can equally arrive as a
@@ -1578,7 +1682,7 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 		// them as faults in the game. The flag has to stay set for the entire
 		// block, including the field loop at the end -- clearing it early lets
 		// routine probing bury the real faults.
-		InterlockedExchange(&g_probing, 1);
+		InterlockedIncrement(&g_probing);
 
 		uint8_t bytes[256] = {};
 		safeReadMemory(bytes, obj, sizeof(bytes));
@@ -1651,7 +1755,7 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 		// of access violations and destabilising the game. Everything now happens
 		// against the buffer already copied above, which cannot fault.
 
-		InterlockedExchange(&g_probing, 0);
+		InterlockedDecrement(&g_probing);
 
 		if (n > 0) {
 			logInfo("%s", hex);
@@ -1675,6 +1779,13 @@ int AudioTracker::init() {
 		logInfo("AudioTracker: QUIET mode (counters only, no logging).");
 	}
 
+	g_verbose = envFlag(L"ALICE_SOUNDFETCHER_VERBOSE");
+	g_dumpObjects = envFlag(L"ALICE_SOUNDFETCHER_DUMPOBJECTS");
+	g_hookComparisons = envFlag(L"ALICE_SOUNDFETCHER_COMPARES");
+
+	logInfo("AudioTracker: verbose=%d dumpObjects=%d hookComparisons=%d",
+		g_verbose ? 1 : 0, g_dumpObjects ? 1 : 0, g_hookComparisons ? 1 : 0);
+
 	if (envFlag(L"ALICE_SOUNDFETCHER_PASSTHROUGH")) {
 		g_passthrough = true;
 		logInfo("AudioTracker: PASSTHROUGH mode (bare jmp stubs, no logging).");
@@ -1687,7 +1798,9 @@ int AudioTracker::init() {
 	loadEntryIndex();
 
 	// Hook the string comparisons that the archive lookup ends in.
-	installCompareHooks();
+	if (g_hookComparisons) {
+		installCompareHooks();
+	}
 	installAssignStringHook();
 
 	// A thread created here does not start until DllMain returns and the loader
