@@ -1,13 +1,16 @@
 #include "AudioTracker.h"
 
 #include <windows.h>
+#include <tlhelp32.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -328,13 +331,27 @@ namespace {
 	// reported and skipped rather than treated as an error, because the exact set
 	// differs per game.
 	const char* const kAudioClasses[] = {
+		// The playback path proper.
 		"CSoundPlayer",
-		"CSoundChannel",
 		"CDirectSoundBuffer",
-		"CDirectSound",
+
+		// The archive side. CSoundFileAFA resolves a member of an .afa archive to
+		// audio data, so it is where an entry name is actually present -- the
+		// decoded sound object does not retain it, which is why dumping
+		// CSoundDataOgg never turned up a name.
+		"CSoundFileAFA",
+		"CSoundFileList",
+
+		// Decoded data.
 		"CSoundDataOgg",
 		"CSoundDataWav",
-		"ISoundData",
+
+		// Routing and grouping; these tend to hold the key that started playback.
+		"CGroupTree",
+		"CSoundChannel",
+		"CSoundChannelList",
+		"CLowLevelChannelList",
+		"CHighLevelChannelList",
 		"CKiwiSoundEngine",
 	};
 	constexpr int kAudioClassCount = (int)(sizeof(kAudioClasses) / sizeof(kAudioClasses[0]));
@@ -382,6 +399,823 @@ namespace {
 		if (n > 0) {
 			logInfo("%s", line);
 		}
+	}
+
+	// -----------------------------------------------------------------------
+	// Stage 2: identifying sound objects among the call arguments.
+	//
+	// Stage 1 established which engine functions are called. Stage 2 needs to
+	// answer a different question: of everything flowing through those calls,
+	// which value is the sound being played?
+	//
+	// The vtable pointer at offset 0 makes this answerable without guessing an
+	// object layout. Anything whose first dword equals one of the vtables we
+	// patched is an instance of that class, so an argument can be classified by
+	// comparing one dword. That is a far safer assumption than a fixed field
+	// offset: if the layout is wrong, the classifier simply returns "not a known
+	// class" rather than reporting confident nonsense.
+	// -----------------------------------------------------------------------
+
+	// vtable address -> class name, for every hooked class.
+	std::vector<std::pair<uintptr_t, std::string>> g_classVtables;
+
+	// Set while deliberately probing possibly-invalid pointers, so the vectored
+	// exception handler does not report the resulting access violations as if
+	// they were faults in the game or in our stubs.
+	LONG g_probing = 0;
+
+	// Object pointers already dumped, so each instance is reported once rather
+	// than on every call that mentions it. Claimed with an interlocked compare
+	// exchange so two game threads cannot both decide to dump the same object.
+	// Sized generously: a collision evicts an entry and causes a re-dump, which
+	// is merely noise, but it is worth avoiding.
+	constexpr size_t kSeenObjectCount = 4096;
+	volatile LONG g_seenObjects[kSeenObjectCount] = {};
+
+	// Comparison hooks to install on the import table.
+	constexpr int kMaxCompareHooks = 4;
+
+	// These helpers use __try/__except and therefore must not construct any
+	// object with a destructor.
+	bool safeRead32(uintptr_t address, uint32_t* out) {
+		__try {
+			*out = *(volatile uint32_t*)address;
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Reads a NUL-terminated ASCII string, returning its length or -1.
+	// Rejects anything that is not plainly printable, so a random heap pointer
+	// is not mistaken for a string.
+	int safeReadAscii(uintptr_t address, char* out, int max) {
+		__try {
+			int i = 0;
+			for (; i < max; ++i) {
+				const char c = ((volatile char*)address)[i];
+				if (c == '\0') {
+					break;
+				}
+				if (c < 0x20 || c > 0x7E) {
+					return -1;
+				}
+				out[i] = c;
+			}
+			out[i] = '\0';
+			return (i > 0 && i < max) ? i : -1;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return -1;
+		}
+	}
+
+	// Classify a candidate pointer by its vtable, or nullptr if it is not an
+	// instance of a class we hooked.
+	const std::string* identifyObject(uintptr_t candidate) {
+		if (candidate < 0x10000 || candidate > 0x7FFEFFFF) {
+			return nullptr;
+		}
+
+		uint32_t vptr = 0;
+		InterlockedExchange(&g_probing, 1);
+		const bool ok = safeRead32(candidate, &vptr);
+		InterlockedExchange(&g_probing, 0);
+		if (!ok) {
+			return nullptr;
+		}
+
+		for (const auto& entry : g_classVtables) {
+			if (entry.first == vptr) {
+				return &entry.second;
+			}
+		}
+		return nullptr;
+	}
+
+	// -----------------------------------------------------------------------
+// Stage 2: the archive entry-name index, shared by the launcher.
+//
+// The launcher has already parsed every .afa, so it writes the entry names out
+// for us. A string found inside a sound object is only reported once it matches
+// a real entry, because "looks like a filename" is a weak signal: pointer data
+// and Japanese display labels score just as well, and an unverified match is
+// worse than no output at all.
+// -----------------------------------------------------------------------
+
+struct IndexRecord {
+	uint64_t hash;
+	uint32_t archiveOffset; // into g_indexText
+	uint32_t nameOffset;    // into g_indexText
+	uint32_t nameLength;
+};
+
+std::vector<char> g_indexText;
+std::vector<IndexRecord> g_index; // sorted by hash
+bool g_indexLoaded = false;
+
+uint64_t fnv1a(const void* data, size_t length) {
+	const uint8_t* p = (const uint8_t*)data;
+	uint64_t h = 1469598103934665603ULL;
+	for (size_t i = 0; i < length; ++i) {
+		h ^= p[i];
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
+// List every module loaded into the game process.
+//
+// The engine registers "AFALoader" and "KiwiSoundEngine" as plugins by name, and
+// everything found so far in the main executable concerns only opening an archive
+// file. If the code that resolves an archive member lives in a plugin, it is not
+// in Evenicle.exe at all, and hooking it means addressing it by module rather
+// than through RTTI. This settles that question directly instead of by
+// inference from strings.
+void logLoadedModules() {
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
+	if (snapshot == INVALID_HANDLE_VALUE) {
+		return;
+	}
+
+	MODULEENTRY32 entry{};
+	entry.dwSize = sizeof(entry);
+	if (!Module32First(snapshot, &entry)) {
+		CloseHandle(snapshot);
+		return;
+	}
+
+	int count = 0;
+	do {
+		char name[MAX_PATH] = {};
+		WideCharToMultiByte(CP_ACP, 0, entry.szModule, -1, name, MAX_PATH - 1, nullptr, nullptr);
+
+		// Only non-system modules are interesting; the base set is always there.
+		const bool isSystem = entry.szExePath[1] == L':' &&
+			(entry.szExePath[2] == L'W' || entry.szExePath[2] == L'w') &&
+			(entry.szExePath[3] == L'i' || entry.szExePath[3] == L'I');
+		if (!isSystem) {
+			logInfo("  module %-34s base=%p size=0x%X",
+				name, (void*)entry.modBaseAddr, entry.modBaseSize);
+			++count;
+		}
+	} while (Module32Next(snapshot, &entry));
+
+	logInfo("AudioTracker: %d non-system modules loaded.", count);
+	CloseHandle(snapshot);
+}
+
+// Enumerate modules once the game has finished starting.
+//
+// Called from a background thread rather than from init(): init() runs inside
+// DllMain, i.e. before the game's own start-up code has executed, so at that
+// point nothing but the core system libraries are loaded and the list says
+// nothing useful about where the engine's plugin code actually lives.
+void moduleSnapshotThread() {
+	Sleep(8000);
+
+	logInfo("AudioTracker: module list 8s after start-up:");
+	logLoadedModules();
+}
+
+void loadEntryIndex() {
+	wchar_t pathBuf[MAX_PATH] = {};
+	const DWORD copied = GetEnvironmentVariableW(
+		L"ALICE_SOUNDFETCHER_INDEX", pathBuf, MAX_PATH);
+	if (copied == 0 || copied >= MAX_PATH) {
+		logInfo("AudioTracker: no entry index supplied; name validation disabled.");
+		return;
+	}
+
+	std::ifstream file(pathBuf, std::ios::binary);
+	if (!file) {
+		logInfo("AudioTracker: entry index could not be opened.");
+		return;
+	}
+
+	file.seekg(0, std::ios::end);
+	const std::streamoff size = file.tellg();
+	file.seekg(0, std::ios::beg);
+	if (size <= 0) {
+		return;
+	}
+
+	g_indexText.resize((size_t)size);
+	file.read(g_indexText.data(), size);
+	if (!file) {
+		g_indexText.clear();
+		return;
+	}
+
+	g_index.reserve(g_indexText.size() / 24 + 16);
+
+	size_t lineStart = 0;
+	while (lineStart < g_indexText.size()) {
+		size_t lineEnd = lineStart;
+		while (lineEnd < g_indexText.size() && g_indexText[lineEnd] != '\n') {
+			++lineEnd;
+		}
+		if (lineEnd > lineStart && g_indexText[lineEnd - 1] != '\r') {
+			size_t sep = lineStart;
+			while (sep < lineEnd && g_indexText[sep] != '\t') {
+				++sep;
+			}
+			if (sep < lineEnd && sep > lineStart) {
+				IndexRecord record{};
+				record.archiveOffset = (uint32_t)lineStart;
+				record.nameOffset = (uint32_t)(sep + 1);
+				record.nameLength = (uint32_t)(lineEnd - (sep + 1));
+				record.hash = fnv1a(&g_indexText[record.nameOffset], record.nameLength);
+				g_index.push_back(record);
+			}
+		}
+		lineStart = lineEnd + 1;
+	}
+
+	std::sort(g_index.begin(), g_index.end(),
+		[](const IndexRecord& a, const IndexRecord& b) { return a.hash < b.hash; });
+
+	g_indexLoaded = true;
+	logInfo("AudioTracker: entry index loaded: %zu names, %zu bytes.",
+		g_index.size(), g_indexText.size());
+}
+
+// Look a raw byte string up. Returns true and fills the archive name when the
+// string is a real entry.
+bool lookupEntryName(const uint8_t* bytes, int length, std::string& archiveOut) {
+	if (!g_indexLoaded || length <= 0) {
+		return false;
+	}
+
+	const uint64_t h = fnv1a(bytes, (size_t)length);
+
+	size_t lo = 0, hi = g_index.size();
+	while (lo < hi) {
+		const size_t mid = lo + (hi - lo) / 2;
+		if (g_index[mid].hash < h) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	if (lo >= g_index.size() || g_index[lo].hash != h) {
+		return false;
+	}
+
+	// The hash matched; confirm the bytes, because a hash collision must never be
+	// reported as a confirmed match.
+	for (size_t i = lo; i < g_index.size() && g_index[i].hash == h; ++i) {
+		const IndexRecord& r = g_index[i];
+		if (r.nameLength != (uint32_t)length) {
+			continue;
+		}
+		if (memcmp(&g_indexText[r.nameOffset], bytes, (size_t)length) == 0) {
+			const char* start = &g_indexText[r.archiveOffset];
+			size_t archiveLen = r.nameOffset - r.archiveOffset;
+			if (archiveLen > 0 && start[archiveLen - 1] == '\t') {
+				--archiveLen;
+			}
+			archiveOut.assign(start, archiveLen);
+			return true;
+		}
+	}
+	return false;
+}
+
+// -----------------------------------------------------------------------
+// Hooking the engine's string comparisons.
+//
+// The archive index is searched by name and that search ends in a string
+// comparison. Hooking the comparison sidesteps everything that made the vtable
+// approach miss: there is no object layout to guess and no need to know which
+// function performs the lookup. Any comparison whose argument is a real archive
+// entry name *is* the lookup.
+//
+// The hook goes on the import address table, not on the function prologue. An
+// IAT entry is a data pointer, so overwriting it touches no code, needs no
+// relocation of displaced instructions, and is trivially reversible.
+// -----------------------------------------------------------------------
+
+// Defined further down with the rest of the Shift-JIS helpers; declared here so
+// the comparison hooks can use them without the file having to be reordered
+// around this block.
+int shiftJisRunLength(const uint8_t* p, int max);
+int safeShiftJisRunLength(uintptr_t address, char* out, int max);
+void escapeToLog(char* out, size_t outCap, const uint8_t* p, int len);
+
+using CompareFn = int(__cdecl*)(const char*, const char*);
+
+CompareFn g_compareOriginals[kMaxCompareHooks] = {};
+int g_compareHookCount = 0;
+
+// Report a comparison argument if it names a real archive entry.
+//
+// Only ever called with a pointer that came out of the game's own data, so the
+// read is guarded and the probing flag is raised while it happens.
+void reportCompareArgument(const char* value, const char* where, int slot) {
+	if (!value || !g_indexLoaded) {
+		return;
+	}
+	const uintptr_t candidate = (uintptr_t)value;
+	if (candidate < 0x10000 || candidate > 0x7FFEFFFF) {
+		return;
+	}
+
+	char raw[512];
+	InterlockedExchange(&g_probing, 1);
+	const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
+	InterlockedExchange(&g_probing, 0);
+
+	if (len < 3) {
+		return;
+	}
+
+	std::string archive;
+	if (!lookupEntryName((const uint8_t*)raw, len, archive)) {
+		return;
+	}
+
+	char text[1024];
+	escapeToLog(text, sizeof(text), (const uint8_t*)raw, len);
+	logInfo("MATCH %s slot=%d name=\"%s\" [%s]", where, slot, text, archive.c_str());
+}
+
+int __cdecl hookedCompare0(const char* a, const char* b) {
+	reportCompareArgument(a, "cmp0", 0);
+	reportCompareArgument(b, "cmp0", 1);
+	return g_compareOriginals[0](a, b);
+}
+int __cdecl hookedCompare1(const char* a, const char* b) {
+	reportCompareArgument(a, "cmp1", 0);
+	reportCompareArgument(b, "cmp1", 1);
+	return g_compareOriginals[1](a, b);
+}
+int __cdecl hookedCompare2(const char* a, const char* b) {
+	reportCompareArgument(a, "cmp2", 0);
+	reportCompareArgument(b, "cmp2", 1);
+	return g_compareOriginals[2](a, b);
+}
+int __cdecl hookedCompare3(const char* a, const char* b) {
+	reportCompareArgument(a, "cmp3", 0);
+	reportCompareArgument(b, "cmp3", 1);
+	return g_compareOriginals[3](a, b);
+}
+
+CompareFn g_compareWrappers[kMaxCompareHooks] = {
+	hookedCompare0, hookedCompare1, hookedCompare2, hookedCompare3
+};
+
+// Import names whose signature is (const char*, const char*).
+const char* const kCompareImports[] = {
+	"strcmp", "_stricmp", "strcmpi", "lstrcmpA", "lstrcmpiA"
+};
+
+void installCompareHooks() {
+	const auto* base = (const uint8_t*)g_moduleBase;
+	const auto* dos = (const IMAGE_DOS_HEADER*)base;
+	const auto* nt = (const IMAGE_NT_HEADERS32*)(base + dos->e_lfanew);
+	const IMAGE_DATA_DIRECTORY* dir =
+		&nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+
+	if (!dir->VirtualAddress || !dir->Size) {
+		return;
+	}
+
+	const auto* descriptor = (const IMAGE_IMPORT_DESCRIPTOR*)(base + dir->VirtualAddress);
+
+	for (; descriptor->Name; ++descriptor) {
+		// Both thunks are required. A descriptor with OriginalFirstThunk == 0 is a
+		// bound import, and walking the name table would then start at the MZ
+		// header and run off into unmapped memory -- which is exactly how this
+		// loop first crashed.
+		if (!descriptor->FirstThunk || !descriptor->OriginalFirstThunk) {
+			continue;
+		}
+
+		// FirstThunk is the import address table: the writable copy of the bindings,
+		// which is exactly what has to be patched. OriginalFirstThunk is the
+		// read-only name table and is walked alongside it only to recover names.
+		IMAGE_THUNK_DATA* thunk =
+			(IMAGE_THUNK_DATA*)(void*)(base + descriptor->FirstThunk);
+		const auto* names =
+			(const IMAGE_THUNK_DATA*)(base + descriptor->OriginalFirstThunk);
+
+		for (int guard = 0; guard < 4096; ++guard) {
+			if (!thunk->u1.Function || !names->u1.AddressOfData) {
+				break;
+			}
+			if (thunk->u1.Function == names->u1.Function) {
+				++thunk;
+				++names;
+				continue; // ordinal import; no name to match on
+			}
+
+			const auto* hint =
+				(const IMAGE_IMPORT_BY_NAME*)(base + names->u1.AddressOfData);
+			const char* importName = (const char*)hint->Name;
+
+			for (size_t want = 0; want < sizeof(kCompareImports) / sizeof(kCompareImports[0]); ++want) {
+				if (strcmp(importName, kCompareImports[want]) != 0) {
+					continue;
+				}
+				if (g_compareHookCount >= kMaxCompareHooks) {
+					return;
+				}
+
+				const int slot = g_compareHookCount++;
+				g_compareOriginals[slot] =
+					reinterpret_cast<CompareFn>(thunk->u1.Function);
+
+				// Make the page writable, swap the slot, restore protection.
+				DWORD oldProtect = 0;
+				if (!VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+						PAGE_READWRITE, &oldProtect)) {
+					--g_compareHookCount;
+					return;
+				}
+				thunk->u1.Function =
+					reinterpret_cast<ULONG_PTR>(g_compareWrappers[slot]);
+				FlushInstructionCache(GetCurrentProcess(), &thunk->u1.Function,
+					sizeof(thunk->u1.Function));
+				VirtualProtect(&thunk->u1.Function, sizeof(thunk->u1.Function),
+					oldProtect, &oldProtect);
+
+				logInfo("AudioTracker: hooked import %s -> wrapper %d", importName, slot);
+				return; // one hook per imported name is enough
+			}
+		}
+	}
+}
+
+// -----------------------------------------------------------------------
+// Hooking the engine's own string assignment.
+//
+// The executable imports no CRT string comparison at all -- no strcmp, _stricmp,
+// strcmpi, lstrcmpA, strncmp, memcmp or wcscmp appears anywhere in the import
+// table -- so there is nothing of that kind to hook. What it does have is
+// 0x00460509, its own std::string::assign(const char*):
+//
+//   00460509  mov eax, 005821C9        ; allocator
+//   00460518  mov edi, ecx             ; this
+//   0046051d  mov ebx, [ebp+8]         ; source
+//   00460528  mov [edi+14h], 0Fh      ; _Myres = 15, so small-string
+//   00460534  <strlen loop>
+//   00460549  cmp eax, 10h             ; capacity < 16 -> keep it inline
+//   00460558  call 00526480            ; memcpy
+//   00460560  mov byte [esi+ebx], 0
+//
+// Every name the engine holds -- including an archive entry name -- has to pass
+// through this function, so validating the source argument against the index
+// needs no knowledge of any object layout at all. Its first instruction is
+// exactly five bytes, so it relocates cleanly: overwrite it with a jump, and
+// replay the displaced bytes inside the stub.
+// -----------------------------------------------------------------------
+
+// Default target: the std::string::assign identified above, as an RVA so it
+// survives a different load address. Override with ALICE_SOUNDFETCHER_ASSIGNHOOK
+// (decimal RVA) to retarget without a rebuild.
+constexpr uintptr_t kStringAssignRva = 0x00060509;
+
+using AssignHookFn = void(__cdecl*)(const char* source);
+AssignHookFn g_stringAssignOriginal = nullptr;
+
+void __cdecl onAssignString(const char* source) {
+	if (g_indexLoaded && source) {
+		const uintptr_t candidate = (uintptr_t)source;
+		if (candidate >= 0x10000 && candidate <= 0x7FFEFFFF) {
+			char raw[512];
+			InterlockedExchange(&g_probing, 1);
+			const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
+			InterlockedExchange(&g_probing, 0);
+
+			if (len >= 3) {
+				std::string archive;
+				if (lookupEntryName((const uint8_t*)raw, len, archive)) {
+					char text[1024];
+					escapeToLog(text, sizeof(text), (const uint8_t*)raw, len);
+					logInfo("MATCH assign name=\"%s\" [%s]", text, archive.c_str());
+				}
+			}
+		}
+	}
+}
+
+// Byte offsets are spelled out and each entry carries its own length comment
+// because every one of these was wrong at least once: `FF 74 24 14` is four
+// bytes, not three, and getting that wrong silently shifts the call and the
+// jump that follow it, which sends execution into the middle of the stub.
+constexpr size_t kAssignStubSize = 32;
+constexpr size_t kAssignStubSaveBegin = 0;   // 9C 50 51 52                     4 bytes
+constexpr size_t kAssignStubPushArg = 4;     // FF 74 24 14                     4 bytes
+constexpr size_t kAssignStubCall = 8;        // E8 <rel32>                      5 bytes
+constexpr size_t kAssignStubClean = 13;      // 83 C4 04                        3 bytes
+constexpr size_t kAssignStubRestore = 16;    // 5A 59 58 9D                     4 bytes
+constexpr size_t kAssignStubDisplaced = 20;  // B8 <imm32>                      5 bytes
+constexpr size_t kAssignStubJmp = 25;        // E9 <rel32>                      5 bytes
+static_assert(kAssignStubJmp + 5 <= kAssignStubSize, "assign stub overruns");
+
+void installAssignStringHook() {
+	if (!g_moduleBase) {
+		return;
+	}
+
+	uintptr_t rva = kStringAssignRva;
+	wchar_t override[16] = {};
+	if (GetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_ASSIGNHOOK",
+			override, (DWORD)(sizeof(override) / sizeof(override[0]))) > 0) {
+		rva = (uintptr_t)_wtoi(override);
+	}
+
+	uint8_t* target = (uint8_t*)(g_moduleBase + rva);
+	if (!isExecutable((uintptr_t)target)) {
+		logInfo("AudioTracker: string-assign hook target RVA 0x%X is not executable.", rva);
+		return;
+	}
+
+	// Refuse anything whose opening instruction is not exactly the five bytes we
+	// know how to replay. A different function at the same RVA, or one that
+	// starts with a relative branch, must not be patched on a guess.
+	uint8_t original[5] = {};
+	memcpy(original, target, sizeof(original));
+	if (original[0] != 0xB8) { // mov eax, imm32
+		logInfo("AudioTracker: string-assign hook skipped: opening byte 0x%02X "
+			"is not the expected `mov eax, imm32`.", original[0]);
+		return;
+	}
+	const uint32_t displacedImmediate = (uint32_t)original[1] |
+		((uint32_t)original[2] << 8) |
+		((uint32_t)original[3] << 16) |
+		((uint32_t)original[4] << 24);
+
+	uint8_t* stub = (uint8_t*)VirtualAlloc(nullptr, kAssignStubSize,
+		MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+	if (!stub) {
+		return;
+	}
+	memset(stub, 0xCC, kAssignStubSize);
+
+	stub[kAssignStubSaveBegin] = 0x9C;     // pushfd
+	stub[kAssignStubSaveBegin + 1] = 0x50; // push eax
+	stub[kAssignStubSaveBegin + 2] = 0x51; // push ecx
+	stub[kAssignStubSaveBegin + 3] = 0x52; // push edx
+
+	// [esp+20h] after the four saves is the caller's first stack argument, which
+	// for std::string::assign is the source char*.
+	stub[kAssignStubPushArg] = 0xFF;
+	stub[kAssignStubPushArg + 1] = 0x74;
+	stub[kAssignStubPushArg + 2] = 0x24;
+	stub[kAssignStubPushArg + 3] = 0x14;
+
+	const uintptr_t onAssign = (uintptr_t)&onAssignString;
+	stub[kAssignStubCall] = 0xE8;
+	const int32_t callRel = (int32_t)(onAssign - (uintptr_t)(stub + kAssignStubCall + 5));
+	memcpy(stub + kAssignStubCall + 1, &callRel, sizeof(callRel));
+
+	stub[kAssignStubClean] = 0x83;                 // add esp, 4
+	stub[kAssignStubClean + 1] = 0xC4;
+	stub[kAssignStubClean + 2] = 0x04;
+
+	stub[kAssignStubRestore] = 0x5A;     // pop edx
+	stub[kAssignStubRestore + 1] = 0x59; // pop ecx
+	stub[kAssignStubRestore + 2] = 0x58; // pop eax
+	stub[kAssignStubRestore + 3] = 0x9D; // popfd
+
+	// Replay the instruction we displaced, then resume at the next one.
+	stub[kAssignStubDisplaced] = 0xB8;
+	memcpy(stub + kAssignStubDisplaced + 1, &displacedImmediate, 4);
+
+	stub[kAssignStubJmp] = 0xE9;
+	const int32_t resumeRel = (int32_t)((uintptr_t)(target + 5) -
+		(uintptr_t)(stub + kAssignStubJmp + 5));
+	memcpy(stub + kAssignStubJmp + 1, &resumeRel, sizeof(resumeRel));
+
+	FlushInstructionCache(GetCurrentProcess(), stub, kAssignStubSize);
+
+	// Publish the entry point so the jmp written below lands in the stub.
+	DWORD oldProtect = 0;
+	if (!VirtualProtect(target, 5, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+		VirtualFree(stub, 0, MEM_RELEASE);
+		logInfo("AudioTracker: VirtualProtect on the assign hook failed (%lu).",
+			GetLastError());
+		return;
+	}
+
+	// E9 rel32 measured from the end of the instruction, i.e. target + 5.
+	target[0] = 0xE9;
+	const int32_t entryRel = (int32_t)((uintptr_t)stub - (uintptr_t)(target + 5));
+	memcpy(target + 1, &entryRel, sizeof(entryRel));
+	FlushInstructionCache(GetCurrentProcess(), target, 5);
+	VirtualProtect(target, 5, oldProtect, &oldProtect);
+
+	g_stringAssignOriginal = (AssignHookFn)target; // unusable after patching; kept for clarity
+
+	logInfo("AudioTracker: hooked std::string::assign at %p -> stub %p",
+		target, stub);
+
+	// Print the emitted bytes so the encoding can be checked by eye rather than
+	// inferred from a crash.
+	{
+		char line[256];
+		int n = snprintf(line, sizeof(line), "  assign-stub bytes:");
+		for (size_t i = 0; i < kAssignStubSize && n > 0 && n < (int)sizeof(line) - 4; ++i) {
+			n += snprintf(line + n, sizeof(line) - (size_t)n, " %02X", stub[i]);
+		}
+		if (n > 0) {
+			logInfo("%s", line);
+		}
+	}
+}
+
+// Length of the printable Shift-JIS run starting at p, capped at max.
+	//
+	// Archive entry names in these games are raw Shift-JIS (CP932), so an
+	// ASCII-only scanner reports nothing at all. CP932 two-byte characters have
+	// lead bytes 0x81-0x9F *or* 0xE0-0xFC, and the trail byte is 0x40-0x7E or
+	// 0x80-0xFC. Accepting only a handful of lead bytes truncates names at the
+	// first hiragana/katakana character, which is what happened to
+	// "Attack/Defense.ogg" -- it was being reported as "ttack/Defense o".
+	int shiftJisRunLength(const uint8_t* p, int max) {
+		int i = 0;
+		int repeat = 1;
+		while (i < max && p[i] != 0x00) {
+			const uint8_t c = p[i];
+
+			// Four identical bytes in a row is not text. 0xDD in particular is both
+			// a legitimate half-width katakana byte and the value Windows fills
+			// freshly committed heap with, so uninitialised memory reads as a long
+			// run of "characters" and was being reported as a 44-character string.
+			if (i > 0 && p[i - 1] == c) {
+				++repeat;
+				if (repeat > 3) {
+					break;
+				}
+			} else {
+				repeat = 1;
+			}
+
+			// ASCII, plus the half-width katakana block, which is single byte.
+			if ((c >= 0x20 && c <= 0x7E) || (c >= 0xA1 && c <= 0xDF)) {
+				++i;
+				continue;
+			}
+
+			const bool isLead = (c >= 0x81 && c <= 0x9F) || (c >= 0xE0 && c <= 0xFC);
+			if (!isLead || i + 1 >= max) {
+				break;
+			}
+			const uint8_t trail = p[i + 1];
+			if (!((trail >= 0x40 && trail <= 0x7E) || (trail >= 0x80 && trail <= 0xFC))) {
+				break;
+			}
+			i += 2;
+		}
+		return i;
+	}
+
+	// Copy from a possibly-unmapped address.
+	//
+	// This lives in its own function because a function containing __try cannot
+	// also hold objects that need unwinding, and the call site deals in
+	// std::string. Returns false when the read faulted.
+	bool safeReadMemory(void* dst, uintptr_t src, size_t length) {
+		__try {
+			memcpy(dst, (const void*)src, length);
+			return true;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return false;
+		}
+	}
+
+	// Same, but reading through a pointer that may not be mapped.
+	//
+	// The unguarded version of this walked off into unmapped memory and took the
+	// game down with it. Any read of a value taken out of an object field has to
+	// be protected, because such a field is arbitrary data as far as this code is
+	// concerned.
+	int safeShiftJisRunLength(uintptr_t address, char* out, int max) {
+		__try {
+			const int len = shiftJisRunLength((const uint8_t*)address, max);
+			if (len > 0) {
+				memcpy(out, (const void*)address, (size_t)len);
+				out[len] = '\0';
+			}
+			return len;
+		} __except (EXCEPTION_EXECUTE_HANDLER) {
+			return -1;
+		}
+	}
+
+	// How much a candidate run looks like an archive entry name.
+	//
+	// Widening the Shift-JIS ranges made the scanner accept so much that plain
+	// pointer data read as "text" and the longest run was no longer the right
+	// pick. An archive entry name is recognisable by shape: directory separators,
+	// an extension, and plenty of ASCII. Scoring on that beats picking by length.
+	int nameScore(const uint8_t* p, int len) {
+		int score = 0;
+		bool hasSeparator = false;
+		bool hasExtension = false;
+
+		for (int i = 0; i < len; ++i) {
+			const uint8_t c = p[i];
+			if ((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+				(c >= 'a' && c <= 'z')) {
+				score += 2;
+			} else if (c == '/') {
+				score += 2;
+				hasSeparator = true;
+			} else if (c == '.') {
+				// a dot immediately followed by letters is an extension
+				if (i + 1 < len) {
+					const uint8_t n = p[i + 1];
+					if ((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z')) {
+						hasExtension = true;
+						score += 3;
+					}
+				}
+				score += 1;
+			} else if (c == '_' || c == '-') {
+				score += 1;
+			} else if (c >= 0x81) {
+				score += 1; // a legitimate two-byte character, worth something
+			} else {
+				score -= 1;
+			}
+		}
+
+		if (hasSeparator) {
+			score += 25;
+		}
+		if (hasExtension) {
+			score += 45;
+		}
+		if (len < 4) {
+			score -= 50;
+		}
+		return score;
+	}
+
+	// Copy a run out with every non-ASCII byte escaped.
+	//
+	// The names are Shift-JIS and the log is read back as plain bytes, so writing
+	// them raw produces mojibake in any console whose code page is not 932. The
+	// escaped form is unambiguous and can be matched byte-for-byte against the
+	// names reported by `alice ar list`.
+	void escapeToLog(char* out, size_t outCap, const uint8_t* p, int len) {
+		size_t used = 0;
+		for (int i = 0; i < len && used + 5 < outCap; ++i) {
+			const uint8_t c = p[i];
+			if (c >= 0x20 && c < 0x7F) {
+				out[used++] = (char)c;
+			} else {
+				used += (size_t)snprintf(out + used, outCap - used, "\\x%02X", c);
+			}
+		}
+		out[used] = '\0';
+	}
+
+	bool isSoundDataClass(const std::string& name) {
+		return name.rfind("CSoundData", 0) == 0;
+	}
+
+	// Classes whose instances get a one-off memory dump.
+	//
+	// The decoded sound object is the obvious candidate, but the decoded data
+	// itself carries no name field, so the player and channel objects are dumped
+	// as well: whichever of them was handed an archive entry name is where the
+	// name actually is.
+	bool isDumpClass(const std::string& name) {
+		return isSoundDataClass(name) ||
+			name == "CSoundPlayer" ||
+			name == "CSoundChannel" ||
+			name == "CKiwiSoundEngine";
+	}
+
+	// Claim an (object, slot) pair for dumping. Returns true only the first time.
+	//
+	// Keyed on the slot as well as the object on purpose. Claiming once per object
+	// caught it during construction, when the memory still belonged to a previous
+	// occupant of the pool: a vtable pointer already saying CSoundDataOgg while
+	// the rest of the block still held an unrelated texture name and script text.
+	// Claiming per slot instead samples the object at each stage of its lifecycle,
+	// which is where the entry name actually gets written.
+	//
+	// The compare-and-swap must be seeded with the value that was actually read.
+	// Seeding it with the key instead looks tidier but is wrong: the exchange only
+	// stores when *slot already equals the comparand, so on a fresh zeroed slot the
+	// store is skipped and nothing is ever marked as seen.
+	bool claimObjectDump(uintptr_t obj, int slot) {
+		if (obj == 0) {
+			return false;
+		}
+		const uint32_t key = (uint32_t)obj ^ (uint32_t)((slot + 1) * 0x9E3779B1u);
+		const size_t index = ((key >> 3) ^ (key >> 17)) & (kSeenObjectCount - 1);
+		const LONG current = g_seenObjects[index];
+		if (current == (LONG)key) {
+			return false; // already dumped
+		}
+		const LONG previous =
+			InterlockedCompareExchange(&g_seenObjects[index], (LONG)key, current);
+		return previous == current; // we won the race
 	}
 
 	// Resolve which classes to hook.
@@ -530,6 +1364,13 @@ namespace {
 			return EXCEPTION_CONTINUE_SEARCH;
 		}
 
+		// Access violations raised on purpose while probing candidate argument
+		// pointers are expected and must not be reported as faults; otherwise
+		// routine probing buries the real ones.
+		if (g_probing) {
+			return EXCEPTION_CONTINUE_SEARCH;
+		}
+
 		const uintptr_t fault = (uintptr_t)info->ExceptionRecord->ExceptionAddress;
 		const bool inStubs =
 			g_stubBase != nullptr &&
@@ -628,15 +1469,196 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 	char stamp[32];
 	AudioTrackerInternals::timestamp(stamp, sizeof(stamp));
 
-	char line[256];
-	int written = snprintf(line, sizeof(line),
-		"%s CALL %s slot=%d this=%p sp0=%p sp1=%p\r\n",
-		stamp, target.className.c_str(), target.slot, self, sp0, sp1);
+	// Classify the incoming arguments before formatting, so the event line shows
+	// what the values actually are rather than leaving that to interpretation.
+	const std::string* sp0Class = identifyObject((uintptr_t)sp0);
+	const std::string* sp1Class = identifyObject((uintptr_t)sp1);
+
+	char line[320];
+	int written;
+	if (sp0Class || sp1Class) {
+		written = snprintf(line, sizeof(line),
+			"%s CALL %s slot=%d this=%p sp0=%s(%p) sp1=%s(%p)\r\n",
+			stamp, target.className.c_str(), target.slot, self,
+			sp0Class ? sp0Class->c_str() : "?", sp0,
+			sp1Class ? sp1Class->c_str() : "?", sp1);
+	} else {
+		written = snprintf(line, sizeof(line),
+			"%s CALL %s slot=%d this=%p sp0=%p sp1=%p\r\n",
+			stamp, target.className.c_str(), target.slot, self, sp0, sp1);
+	}
 	if (written <= 0) {
 		return;
 	}
 
 	AudioTrackerInternals::write(line);
+
+	// A sound data object is what we ultimately care about, so dump its memory
+	// once per instance. The layout is deliberately *not* assumed here: reading
+	// the raw bytes is how the layout gets established in the first place, and
+	// guessing an offset now would risk printing a plausible-looking but wrong
+	// filename, which is worse than printing nothing.
+	//
+	// Before any of that: the entry name may simply arrive as a call argument,
+	// as a bare pointer to a Shift-JIS string. CSoundFileAFA is handed the member
+	// name to resolve, so that is the most direct place a confirmed name can be
+	// obtained -- and it needs no layout knowledge at all.
+	{
+		const void* argValues[2] = { sp0, sp1 };
+		for (int a = 0; a < 2; ++a) {
+			const uintptr_t candidate = (uintptr_t)argValues[a];
+			if (candidate < 0x10000) {
+				continue;
+			}
+
+			char raw[512];
+			InterlockedExchange(&g_probing, 1);
+
+			const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
+			if (len >= 3) {
+				std::string archive;
+				char text[1024];
+
+				// Exact match first: the engine may pass the bare member name.
+				if (lookupEntryName((const uint8_t*)raw, len, archive)) {
+					escapeToLog(text, sizeof(text), (const uint8_t*)raw, len);
+					logInfo("PLAY %s slot=%d arg%d name=\"%s\" [%s]",
+						target.className.c_str(), target.slot, a, text, archive.c_str());
+				}
+				else {
+					// Otherwise the name may be the tail of a path such as
+					// "EvenicleVoice/10001.opus"; retry on the last component.
+					int lastSlash = -1;
+					for (int i = 0; i < len; ++i) {
+						if (raw[i] == '/') {
+							lastSlash = i;
+						}
+					}
+					if (lastSlash >= 0) {
+						const uint8_t* tail = (const uint8_t*)raw + lastSlash + 1;
+						const int tailLen = len - lastSlash - 1;
+						if (tailLen >= 3 && lookupEntryName(tail, tailLen, archive)) {
+							escapeToLog(text, sizeof(text), tail, tailLen);
+							logInfo("PLAY %s slot=%d arg%d name=\"%s\" [%s]",
+								target.className.c_str(), target.slot, a,
+								text, archive.c_str());
+						}
+					}
+				}
+			}
+
+			InterlockedExchange(&g_probing, 0);
+		}
+	}
+	// The object of interest is usually `this` rather than an argument -- a call
+	// like CSoundDataOgg::SomeMethod() *is* operating on the sound object. The
+	// arguments are still checked, because a sound object can equally arrive as a
+	// parameter to a player or channel method.
+	const std::string* dumpClass[3] = { nullptr, sp0Class, sp1Class };
+	const void* dumpValue[3] = { nullptr, sp0, sp1 };
+	if (isDumpClass(target.className)) {
+		dumpClass[0] = &target.className;
+		dumpValue[0] = self;
+	}
+
+	for (int i = 0; i < 3; ++i) {
+		if (!dumpClass[i] || !isDumpClass(*dumpClass[i])) {
+			continue;
+		}
+		if (!claimObjectDump((uintptr_t)dumpValue[i], target.slot)) {
+			continue;
+		}
+
+		const uintptr_t obj = (uintptr_t)dumpValue[i];
+
+		// Every read below deliberately touches addresses taken from object
+		// fields, which are not guaranteed to be mapped. The whole block is
+		// therefore marked as probing: the failures are expected, they are caught
+		// by the __except in each helper, and the vectored handler must not report
+		// them as faults in the game. The flag has to stay set for the entire
+		// block, including the field loop at the end -- clearing it early lets
+		// routine probing bury the real faults.
+		InterlockedExchange(&g_probing, 1);
+
+		uint8_t bytes[256] = {};
+		safeReadMemory(bytes, obj, sizeof(bytes));
+
+		char hex[1024];
+		int n = snprintf(hex, sizeof(hex), "OBJ %s %p bytes:",
+			dumpClass[i]->c_str(), dumpValue[i]);
+		for (int k = 0; k < 256 && n > 0 && n < (int)sizeof(hex) - 4; ++k) {
+			n += snprintf(hex + n, sizeof(hex) - (size_t)n, " %02X", bytes[k]);
+		}
+
+		char ascii[33];
+		for (int k = 0; k < 32; ++k) {
+			ascii[k] = (bytes[k] >= 0x20 && bytes[k] < 0x7F) ? (char)bytes[k] : '.';
+		}
+		ascii[32] = '\0';
+
+		// Hunt for the entry name inside the bytes already read, rather than by probing
+		// further memory. Scanning a local buffer cannot fault at all, so the
+		// search is both safer and faster than chasing pointer fields.
+		//
+		// Every plausible run is tested against the index, and only confirmed
+		// matches are reported as names. Scoring alone accepted "kimg_logo.png",
+		// which looks entirely real and exists nowhere in this game's archives.
+		int bestOffset = -1, bestLength = 0, bestScore = 0;
+		int matches = 0;
+
+		for (int k = 0; k + 3 <= 256; ++k) {
+			const int len = shiftJisRunLength(bytes + k, 256 - k);
+			if (len < 3) {
+				continue;
+			}
+
+			std::string archive;
+			if (lookupEntryName(bytes + k, len, archive)) {
+				char escaped[1024];
+				escapeToLog(escaped, sizeof(escaped), bytes + k, len);
+				logInfo("NAME %s %p +0x%02X len=%d = \"%s\"  [%s]",
+					dumpClass[i]->c_str(), dumpValue[i], k, len,
+					escaped, archive.c_str());
+				++matches;
+			}
+
+			const int score = nameScore(bytes + k, len);
+			if (len >= 4 && (score > bestScore ||
+				(score == bestScore && len > bestLength))) {
+				bestScore = score;
+				bestLength = len;
+				bestOffset = k;
+			}
+		}
+
+		// Nothing in this object matched a real entry. Record the best near-miss
+		// so the next round of hunting has something to go on, but say plainly
+		// that it is not a match.
+		if (matches == 0 && bestOffset >= 0 && bestLength >= 4 && bestScore > 0) {
+			char escaped[1024];
+			escapeToLog(escaped, sizeof(escaped), bytes + bestOffset, bestLength);
+			logInfo("NAME? %s %p +0x%02X len=%d score=%d = \"%s\" (no index match)",
+				dumpClass[i]->c_str(), dumpValue[i], bestOffset,
+				bestLength, bestScore, escaped);
+		}
+
+		// Deliberately no pointer chasing here.
+		//
+		// An earlier version interpreted every field as a pointer and as an MSVC
+		// std::string, which meant following values read out of an object into
+		// memory of unknown validity. It never produced a single confirmed name --
+		// entry names turned out to be stored inline -- while generating hundreds
+		// of access violations and destabilising the game. Everything now happens
+		// against the buffer already copied above, which cannot fault.
+
+		InterlockedExchange(&g_probing, 0);
+
+		if (n > 0) {
+			logInfo("%s", hex);
+		}
+		logInfo("OBJ %s %p first32-ascii: %s",
+			dumpClass[i]->c_str(), dumpValue[i], ascii);
+	}
 }
 
 int AudioTracker::init() {
@@ -659,6 +1681,22 @@ int AudioTracker::init() {
 	}
 
 	describeModule();
+
+	// Load the entry-name index before any hooking, so name validation is ready
+	// for the very first event rather than warming up later.
+	loadEntryIndex();
+
+	// Hook the string comparisons that the archive lookup ends in.
+	installCompareHooks();
+	installAssignStringHook();
+
+	// A thread created here does not start until DllMain returns and the loader
+	// lock is released, which is exactly when the delay becomes meaningful.
+	CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+		moduleSnapshotThread();
+		return 0;
+	}, nullptr, 0, nullptr);
+
 	logInfo("AudioTracker: module base=%p size=0x%X exec ranges=%d",
 		(void*)g_moduleBase, (unsigned)g_moduleSize, (int)g_execRanges.size());
 
@@ -905,6 +1943,13 @@ int AudioTracker::init() {
 	g_stubBase = stubBase;
 	g_stubCount = stubIndex;
 	g_slotCount = stubIndex;
+
+	// Publish the vtable map so the hook can recognise instances of these classes
+	// among its call arguments. This is what lets Stage 2 identify a sound object
+	// by its vtable instead of by an assumed field offset.
+	for (const Plan& plan : plans) {
+		g_classVtables.emplace_back(plan.vtable, plan.className);
+	}
 
 	logInfo("AudioTracker: hooked %d slots across %zu classes, all verified.",
 		stubIndex, plans.size());

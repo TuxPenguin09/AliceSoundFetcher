@@ -108,6 +108,11 @@ int main(int argc, char* argv[]) {
 	FileScan::printFiles(afaFiles);
 	std::cout << "afa: Found " << afaFiles.size() << "\n" << std::endl;
 
+	// Keep every archive. The names are handed to the injected DLL so it can
+	// check a string it finds inside a sound object against the real entry list
+	// rather than trusting that a plausible-looking run of bytes is a filename.
+	std::vector<AFAArchive> allArchives;
+
 	std::cout << "afa: Indexing AFA archives..." << std::endl;
 	for (const auto& afaFile : afaFiles) {
 		AFAArchive archive = AFARead::parse(afaFile);
@@ -115,6 +120,7 @@ int main(int argc, char* argv[]) {
 		if (archive.valid) {
 			std::cout << "afa: Indexed " << archive.entries.size() << " entries from "
 				<< afaFile.filename().string() << std::endl;
+			allArchives.push_back(std::move(archive));
 		}
 		else {
 			std::cout << "afa: Skipped " << afaFile.filename().string()
@@ -140,6 +146,39 @@ int main(int argc, char* argv[]) {
 	// below mirrors them, so the env var is how the two processes agree on it.
 	const fs::path logPath = fs::path(selfPath).parent_path() / "AliceSoundFetcher.log";
 	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_LOG", logPath.c_str());
+
+	// Hand the entry names to the DLL.
+	//
+	// The runtime finds Shift-JIS strings inside sound objects, but "looks like a
+	// filename" is a weak signal -- pointer data and Japanese display labels also
+	// score well. Giving the DLL the real entry list lets it confirm a candidate
+	// before reporting it, which is the difference between a measurement and a
+	// guess. Format is one line per entry: archive name, TAB, raw entry name
+	// bytes, LF. Written in binary because the names are Shift-JIS and must not
+	// be transcoded on the way through.
+	const fs::path indexPath = fs::path(selfPath).parent_path() / "AliceSoundFetcher.names";
+	{
+		std::ofstream index(indexPath, std::ios::binary | std::ios::trunc);
+		size_t written = 0;
+		if (index) {
+			for (const AFAArchive& archive : allArchives) {
+				const std::string archiveName = fs::path(archive.archPath).filename().string();
+				for (const AFAEntry& entry : archive.entries) {
+					index << archiveName << '\t' << entry.fileName << '\n';
+					++written;
+				}
+			}
+		}
+		if (index && index.good()) {
+			std::cout << "afa: Wrote " << written << " entry names to "
+				<< indexPath.filename().string() << std::endl;
+			SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_INDEX", indexPath.c_str());
+		}
+		else {
+			std::cerr << "afa: Warning: could not write " << indexPath
+				<< "; the runtime will not be able to validate names." << std::endl;
+		}
+	}
 
 	// The live view gets its own console so this launcher's output stays
 	// readable, and it keeps running after the game closes. It is this same
