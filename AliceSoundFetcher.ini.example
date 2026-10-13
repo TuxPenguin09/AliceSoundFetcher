@@ -28,6 +28,21 @@ dumpObjects = 0
 # absence is what identified the engine's own comparison routine.
 hookComparisons = 0
 
+# Archives to report, comma separated.
+#
+# Empty means "audio extensions only": .ogg .opus .wav .mp3 .flac .m4a .aac.
+# That keeps a session readable, because a game loads far more graphics than
+# sound -- Evenicle reports 19385 audio names against 3541 CG and 221 Flat
+# ones -- and the point of the tool is the audio.
+#
+# Name archives explicitly to override that, for example to report only the
+# sound and voice archives of a game that stores audio under an unexpected
+# extension:
+#
+#   archives = EvenicleSound.afa, EvenicleVoice.afa
+#
+# archives =
+
 # Classes to hook, comma separated. Empty means the built-in list:
 #
 #   CSoundPlayer, CDirectSoundBuffer, CSoundDataOgg, CSoundDataWav,

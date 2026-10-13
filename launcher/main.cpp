@@ -92,7 +92,8 @@ struct Settings {
 	bool verbose = false;
 	bool dumpObjects = false;
 	bool hookComparisons = false;
-	std::string classes; // empty means the built-in list
+	std::string classes;   // empty means the built-in list
+	std::string archives;  // empty means audio extensions only
 };
 
 namespace {
@@ -178,6 +179,8 @@ Settings loadSettings() {
 			settings.hookComparisons = parseBool(value, settings.hookComparisons);
 		} else if (key == "classes") {
 			settings.classes = value;
+		} else if (key == "archives") {
+			settings.archives = value;
 		} else {
 			// An unrecognised key is more likely a typo than a deliberate extra
 			// setting, and a typo that is ignored in silence is exactly the kind of
@@ -306,6 +309,15 @@ int main(int argc, char* argv[]) {
 		SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_CLASSES", wide.c_str());
 		std::cout << "config: hooking only the classes listed in the settings file"
 			<< std::endl;
+	}
+
+	if (!settings.archives.empty()) {
+		const std::wstring wide(settings.archives.begin(), settings.archives.end());
+		SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_ARCHIVES", wide.c_str());
+		std::cout << "config: reporting only these archives: " << settings.archives
+			<< std::endl;
+	} else {
+		std::cout << "config: reporting audio extensions only" << std::endl;
 	}
 
 	// Hand the entry names to the DLL.

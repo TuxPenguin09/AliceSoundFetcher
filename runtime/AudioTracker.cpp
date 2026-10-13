@@ -12,6 +12,8 @@
 #include <cwchar>
 #include <fstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -405,6 +407,11 @@ namespace {
 	// identified 0x00460509 as the real comparison path.
 	bool g_hookComparisons = false;
 
+	// Report the name the player object is currently playing. This is the primary
+	// output: it is what "which sound is playing" means. On by default, because
+	// without it the tool reports what a game loaded rather than what it played.
+	bool g_liveNames = true;
+
 	// Passthrough mode: each stub is nothing but a jump to the original entry, so
 	// the vtable is patched exactly as before but nothing of ours ever executes.
 	//
@@ -554,6 +561,60 @@ std::vector<char> g_indexText;
 std::vector<IndexRecord> g_index; // sorted by hash
 bool g_indexLoaded = false;
 
+// How a candidate string was recognised.
+enum class NameMatch {
+	None,
+	Exact,      // the whole entry name, extension included
+	StemOnly,   // the entry name without its extension
+};
+
+const char* nameMatchKind(NameMatch match) {
+	switch (match) {
+	case NameMatch::Exact:    return "exact";
+	case NameMatch::StemOnly: return "stem";
+	default:                  return "none";
+	}
+}
+
+// Second index over entry names with the extension removed.
+//
+// The engine holds the stem and the extension separately. At archive load it
+// assigns the bare stem, and the ".ogg"/".opus" suffix is appended later on the
+// playback path, so the full name never exists as one string at any point this
+// hook can see. That is why audio produced nothing while CG did: CG names arrive
+// whole, because the engine assigns them exactly as they appear in the archive.
+//
+// Keyed on the stem only, so a hit is only reported when it is unambiguous.
+// Measured across all 23168 entries of Evenicle there are 23167 distinct stems
+// with no collisions at all, but that is a property of this game and not
+// something to assume, so a stem present in more than one archive is recorded
+// as ambiguous and never matched.
+struct StemRecord {
+	uint64_t hash;
+	uint32_t archiveOffset; // into g_indexText
+	uint32_t stemOffset;    // into g_indexText
+	uint32_t stemLength;
+	// Length of the whole entry name from the same offset, i.e. stem plus the
+	// extension. Needed because the archive filter tests the extension, and the
+	// stem on its own has none: filtering on stemLength alone rejects every
+	// entry and silently logs nothing at all.
+	uint32_t fullLength;
+};
+
+constexpr uint32_t kStemAmbiguous = 0xFFFFFFFFu;
+
+std::vector<StemRecord> g_stemIndex; // sorted by hash
+
+// Which archives are reported.
+//
+// Empty means "audio extensions only". Otherwise it is an explicit allow-list of
+// archive names, matched case-insensitively. Set through ALICE_SOUNDFETCHER_ARCHIVES.
+std::unordered_set<std::string> g_archiveAllow;
+
+// How the filter was configured, for the start-up log line.
+bool g_archiveFilterIsExplicit = false;
+size_t g_archiveFilterCount = 0;
+
 uint64_t fnv1a(const void* data, size_t length) {
 	const uint8_t* p = (const uint8_t*)data;
 	uint64_t h = 1469598103934665603ULL;
@@ -630,6 +691,10 @@ void moduleSnapshotThread() {
 	logLoadedModules();
 }
 
+// Defined with the archive-name helpers further down; declared here because the
+// index load needs to configure the filter before it marks ambiguous stems.
+void loadArchiveFilter();
+
 void loadEntryIndex() {
 	wchar_t pathBuf[MAX_PATH] = {};
 	const DWORD copied = GetEnvironmentVariableW(
@@ -687,14 +752,183 @@ void loadEntryIndex() {
 	std::sort(g_index.begin(), g_index.end(),
 		[](const IndexRecord& a, const IndexRecord& b) { return a.hash < b.hash; });
 
+	// Build the stem index from the same records, so it cannot drift out of step
+	// with the full-name index.
+	for (const IndexRecord& record : g_index) {
+		// The extension is the last '.' after the last path separator. Entries are
+		// plain names with no directory part in this game, but allowing for one
+		// costs nothing and avoids cutting at a dot inside a path.
+		size_t dot = (size_t)record.nameLength;
+		for (size_t i = record.nameLength; i > 0; --i) {
+			const char c = g_indexText[record.nameOffset + i - 1];
+			if (c == '/') {
+				break;
+			}
+			if (c == '.') {
+				dot = i - 1;
+				break;
+			}
+		}
+		if (dot == 0 || dot >= record.nameLength) {
+			continue; // no extension, or a dotfile: nothing useful to key on
+		}
+
+		StemRecord stem{};
+		stem.archiveOffset = record.archiveOffset;
+		stem.stemOffset = record.nameOffset;
+		stem.stemLength = (uint32_t)dot;
+		stem.fullLength = record.nameLength;
+		stem.hash = fnv1a(&g_indexText[stem.stemOffset], stem.stemLength);
+		g_stemIndex.push_back(stem);
+	}
+
+	std::sort(g_stemIndex.begin(), g_stemIndex.end(),
+		[](const StemRecord& a, const StemRecord& b) { return a.hash < b.hash; });
+
+	// Read the archive filter before marking ambiguities, so the two steps of the
+	// load are done in one pass over the index.
+	loadArchiveFilter();
+
+	// Mark any stem that occurs more than once, so a lookup can refuse it rather
+	// than pick one of the candidates.
+	size_t ambiguous = 0;
+	for (size_t i = 0; i < g_stemIndex.size();) {
+		size_t j = i;
+		while (j < g_stemIndex.size() && g_stemIndex[j].hash == g_stemIndex[i].hash) {
+			++j;
+		}
+		if (j - i > 1) {
+			const uint64_t h = g_stemIndex[i].hash;
+			bool identical = true;
+			for (size_t k = i + 1; k < j && identical; ++k) {
+				if (g_stemIndex[k].stemLength != g_stemIndex[i].stemLength ||
+					memcmp(&g_indexText[g_stemIndex[k].stemOffset],
+						&g_indexText[g_stemIndex[i].stemOffset],
+						g_stemIndex[i].stemLength) != 0) {
+					identical = false;
+				}
+			}
+			if (!identical) {
+				for (size_t k = i; k < j; ++k) {
+					g_stemIndex[k].archiveOffset = kStemAmbiguous;
+				}
+				++ambiguous;
+			}
+		}
+		i = j;
+	}
+
 	g_indexLoaded = true;
-	logInfo("AudioTracker: entry index loaded: %zu names, %zu bytes.",
-		g_index.size(), g_indexText.size());
+	logInfo("AudioTracker: entry index loaded: %zu names, %zu bytes, %zu stems (%zu ambiguous).",
+		g_index.size(), g_indexText.size(), g_stemIndex.size(), ambiguous);
+
+	if (g_archiveFilterIsExplicit) {
+		// Name the archives so it is obvious when a setting has a typo and the
+		// filter is silently excluding everything.
+		logInfo("AudioTracker: reporting only %zu named archives:", g_archiveAllow.size());
+		for (const std::string& name : g_archiveAllow) {
+			logInfo("AudioTracker:   %s", name.c_str());
+		}
+	} else {
+		logInfo("AudioTracker: reporting audio extensions only (.ogg .opus .wav .mp3 .flac .m4a .aac).");
+	}
 }
 
+// The archive name for a record, i.e. everything before the tab.
+std::string archiveName(uint32_t archiveOffset, uint32_t nameOffset) {
+	const char* start = &g_indexText[archiveOffset];
+	size_t archiveLen = nameOffset - archiveOffset;
+	if (archiveLen > 0 && start[archiveLen - 1] == '\t') {
+		--archiveLen;
+	}
+	return std::string(start, archiveLen);
+}
+
+bool isAudioExtension(const uint8_t* name, uint32_t length);
+
+std::string toLowerAscii(const std::string& s) {
+	std::string out = s;
+	for (char& c : out) {
+		if (c >= 'A' && c <= 'Z') {
+			c = (char)(c - 'A' + 'a');
+		}
+	}
+	return out;
+}
+
+// Read the archive allow-list.
+//
+// An explicit list lets a caller say exactly which archives it wants, which is
+// what makes it possible to report EvenicleSound and EvenicleVoice while saying
+// nothing about EvenicleCG, EvenicleCG2 and EvenicleFlat. Leaving it unset falls
+// back to audio extensions, which keeps the default useful on a title whose
+// archive names are not known in advance.
+void loadArchiveFilter() {
+	wchar_t buffer[2048] = {};
+	const DWORD copied = GetEnvironmentVariableW(
+		L"ALICE_SOUNDFETCHER_ARCHIVES", buffer, 2048);
+
+	if (copied == 0 || copied >= 2048) {
+		g_archiveFilterIsExplicit = false;
+		g_archiveAllow.clear();
+		return;
+	}
+
+	g_archiveFilterIsExplicit = true;
+	g_archiveAllow.clear();
+
+	std::string all;
+	all.reserve(copied);
+	for (DWORD i = 0; i < copied && buffer[i] < 0x80; ++i) {
+		all.push_back((char)buffer[i]);
+	}
+
+	size_t start = 0;
+	while (start <= all.size()) {
+		const size_t comma = all.find(',', start);
+		const size_t end = (comma == std::string::npos) ? all.size() : comma;
+
+		std::string name = all.substr(start, end - start);
+		while (!name.empty() && (name.front() == ' ' || name.front() == '\t')) {
+			name.erase(name.begin());
+		}
+		while (!name.empty() && (name.back() == ' ' || name.back() == '\t')) {
+			name.pop_back();
+		}
+		if (!name.empty()) {
+			g_archiveAllow.insert(toLowerAscii(name));
+		}
+
+		if (comma == std::string::npos) {
+			break;
+		}
+		start = comma + 1;
+	}
+
+	g_archiveFilterCount = g_archiveAllow.size();
+}
+
+// Whether a confirmed entry should be reported.
+bool archiveIsReported(const std::string& archive, const uint8_t* name,
+	uint32_t nameLength) {
+	if (!g_archiveFilterIsExplicit) {
+		return isAudioExtension(name, nameLength);
+	}
+	return g_archiveAllow.count(toLowerAscii(archive)) != 0;
+}
+
+bool lookupEntryStem(const uint8_t* bytes, int length, std::string& archiveOut,
+	NameMatch* matchOut);
+
 // Look a raw byte string up. Returns true and fills the archive name when the
-// string is a real entry.
-bool lookupEntryName(const uint8_t* bytes, int length, std::string& archiveOut) {
+// string is a real entry, or an entry name minus its extension.
+//
+// The distinction is reported through matchOut and matters: an exact hit is the
+// name as the archive spells it, whereas a stem hit means the engine holds the
+// stem and will append the extension separately. Audio only ever produces the
+// second kind.
+bool lookupEntryName(const uint8_t* bytes, int length, std::string& archiveOut,
+	NameMatch* matchOut = nullptr) {
 	if (!g_indexLoaded || length <= 0) {
 		return false;
 	}
@@ -710,24 +944,88 @@ bool lookupEntryName(const uint8_t* bytes, int length, std::string& archiveOut) 
 			hi = mid;
 		}
 	}
-	if (lo >= g_index.size() || g_index[lo].hash != h) {
+	if (lo < g_index.size() && g_index[lo].hash == h) {
+		// The hash matched; confirm the bytes, because a hash collision must never
+		// be reported as a confirmed match.
+		for (size_t i = lo; i < g_index.size() && g_index[i].hash == h; ++i) {
+			const IndexRecord& r = g_index[i];
+			if (r.nameLength != (uint32_t)length) {
+				continue;
+			}
+			if (memcmp(&g_indexText[r.nameOffset], bytes, (size_t)length) == 0) {
+				std::string archive = archiveName(r.archiveOffset, r.nameOffset);
+				if (!archiveIsReported(archive,
+					(const uint8_t*)&g_indexText[r.nameOffset], r.nameLength)) {
+					return false;
+				}
+				archiveOut = std::move(archive);
+				*matchOut = NameMatch::Exact;
+				return true;
+			}
+		}
+	}
+
+	// Not a whole entry name. Try the stem index, which is what identifies audio:
+	// the engine keeps the stem and the extension apart.
+	return lookupEntryStem(bytes, length, archiveOut, matchOut);
+}
+
+// Resolve a candidate that is an entry name minus its extension.
+//
+// Only reports a match when the stem is unambiguous, and says so in the log, so a
+// stem-only hit is never mistaken for a full entry name.
+bool lookupEntryStem(const uint8_t* bytes, int length, std::string& archiveOut,
+	NameMatch* matchOut) {
+	if (g_stemIndex.empty() || length <= 0) {
 		return false;
 	}
 
-	// The hash matched; confirm the bytes, because a hash collision must never be
-	// reported as a confirmed match.
-	for (size_t i = lo; i < g_index.size() && g_index[i].hash == h; ++i) {
-		const IndexRecord& r = g_index[i];
-		if (r.nameLength != (uint32_t)length) {
+	// Cheap reject before any work. Every string handed to this function is a
+	// candidate from live game memory, so the overwhelming majority are not names
+	// at all, and returning immediately on those is what keeps the hook cheap.
+	const uint8_t last = bytes[length - 1];
+	if (last != 0x20 && last != '~') {
+		// A stem ends in an alphanumeric, which in a Shift-JIS name is ASCII or a
+		// half-width katakana byte.
+		if (!((last >= '0' && last <= '9') || (last >= 'A' && last <= 'z') ||
+			(last >= 0xA1 && last <= 0xDF))) {
+			return false;
+		}
+	}
+
+	const uint64_t h = fnv1a(bytes, (size_t)length);
+
+	size_t lo = 0, hi = g_stemIndex.size();
+	while (lo < hi) {
+		const size_t mid = lo + (hi - lo) / 2;
+		if (g_stemIndex[mid].hash < h) {
+			lo = mid + 1;
+		} else {
+			hi = mid;
+		}
+	}
+	if (lo >= g_stemIndex.size() || g_stemIndex[lo].hash != h) {
+		return false;
+	}
+
+	for (size_t i = lo; i < g_stemIndex.size() && g_stemIndex[i].hash == h; ++i) {
+		const StemRecord& r = g_stemIndex[i];
+		if (r.archiveOffset == kStemAmbiguous) {
+			continue; // same stem in more than one entry: refuse to guess
+		}
+		if (r.stemLength != (uint32_t)length) {
 			continue;
 		}
-		if (memcmp(&g_indexText[r.nameOffset], bytes, (size_t)length) == 0) {
-			const char* start = &g_indexText[r.archiveOffset];
-			size_t archiveLen = r.nameOffset - r.archiveOffset;
-			if (archiveLen > 0 && start[archiveLen - 1] == '\t') {
-				--archiveLen;
+		if (memcmp(&g_indexText[r.stemOffset], bytes, (size_t)length) == 0) {
+			std::string archive = archiveName(r.archiveOffset, r.stemOffset);
+			// The filter needs the extension too, so it is tested against the full
+			// entry name rather than the stem.
+			if (!archiveIsReported(archive,
+				(const uint8_t*)&g_indexText[r.stemOffset], r.fullLength)) {
+				return false;
 			}
-			archiveOut.assign(start, archiveLen);
+			archiveOut = std::move(archive);
+			*matchOut = NameMatch::StemOnly;
 			return true;
 		}
 	}
@@ -755,6 +1053,11 @@ int shiftJisRunLength(const uint8_t* p, int max);
 int safeShiftJisRunLength(uintptr_t address, char* out, int max);
 void escapeToLog(char* out, size_t outCap, const uint8_t* p, int len);
 
+// Reads the archive entry stem off an object and logs it when it changes. Defined
+// with the object-layout helpers; declared here because the playback stub needs it
+// and that stub is written against the C-ABI surface below.
+void reportLiveName(uintptr_t object, const std::string& className);
+
 // Confirmed entry names, reported once each.
 //
 // Every name this tool prints goes through here: the name comes from the string
@@ -764,30 +1067,94 @@ void escapeToLog(char* out, size_t outCap, const uint8_t* p, int len);
 // lines and bury everything else. Deduplicating in one place is what keeps a long
 // play session readable.
 //
-// Repeats are counted but not logged again. A summary of the counts at shutdown
-// would be the obvious next step, and is deliberately not here: the game process
-// exits through DLL_PROCESS_DETACH, and doing file I/O from that callback is a
-// good way to turn a clean exit into a hang. The counts are recorded here
-// whenever a caller wants to report them from a safer point.
-std::vector<std::string> g_reportedNames;
-std::vector<int> g_reportedNameCounts;
+// Repeats are counted but not logged again.
+//
+// This is a hash map rather than a vector scanned linearly, and that is not a
+// stylistic choice. Evenicle hands the runtime 19548 distinct names during
+// start-up alone, and a linear scan of a growing vector is quadratic in that
+// count: roughly 190 million string comparisons, all on the game's own audio
+// threads, all inside a hook. That is what made the game visibly slow down once
+// the stem index was added and every voice name started matching. The map makes
+// each lookup proportional to the cost of hashing the name.
+//
+// A summary of the counts at shutdown would be the obvious next step, and is
+// deliberately not here: the game process exits through DLL_PROCESS_DETACH, and
+// doing file I/O from that callback is a good way to turn a clean exit into a
+// hang. The counts are recorded here whenever a caller wants to report them from
+// a safer point.
+std::unordered_map<std::string, int> g_reportedNames;
+
+// Extensions treated as audio when no explicit archive list is configured.
+//
+// The point of the tool is to report audio, and an Evenicle session otherwise
+// produces far more graphic than sound: 3541 CG .webp names and 221 .flat names
+// against 440 .ogg and 18945 .opus. Filtering by extension rather than by
+// hard-coded archive name keeps this working for other System-4 titles, whose
+// archives are also named per-resource.
+bool isAudioExtension(const uint8_t* name, uint32_t length) {
+	static const char* const kAudioExtensions[] = {
+		".ogg", ".opus", ".wav", ".mp3", ".flac", ".m4a", ".aac"
+	};
+
+	// Find the last dot, ignoring any path separator before it.
+	uint32_t dot = length;
+	for (uint32_t i = length; i > 0; --i) {
+		const uint8_t c = name[i - 1];
+		if (c == '/') {
+			break;
+		}
+		if (c == '.') {
+			dot = i - 1;
+			break;
+		}
+	}
+	if (dot >= length) {
+		return false; // no extension
+	}
+
+	for (const char* ext : kAudioExtensions) {
+		const size_t extLen = strlen(ext);
+		if (length - dot != extLen) {
+			continue;
+		}
+		bool same = true;
+		for (size_t i = 0; i < extLen; ++i) {
+			const uint8_t c = name[dot + i];
+			if (c >= 'A' && c <= 'Z') {
+				// Compare case-insensitively without modifying the source bytes.
+				if (c - 'A' + 'a' != (uint8_t)ext[i]) {
+					same = false;
+					break;
+				}
+			} else if (c != (uint8_t)ext[i]) {
+				same = false;
+				break;
+			}
+		}
+		if (same) {
+			return true;
+		}
+	}
+	return false;
+}
 
 void reportConfirmedName(const char* prefix, const uint8_t* bytes, int length,
-	const std::string& archive) {
+	const std::string& archive, NameMatch match) {
 	char text[1024];
 	escapeToLog(text, sizeof(text), bytes, length);
 
 	const std::string key = std::string(prefix) + "|" + archive + "|" + text;
-	for (size_t i = 0; i < g_reportedNames.size(); ++i) {
-		if (g_reportedNames[i] == key) {
-			++g_reportedNameCounts[i];
-			return;
-		}
+	if (++g_reportedNames[key] > 1) {
+		return;
 	}
 
-	g_reportedNames.push_back(key);
-	g_reportedNameCounts.push_back(1);
-	logInfo("%s name=\"%s\" [%s]", prefix, text, archive.c_str());
+	// "exact" is the name exactly as the archive spells it. "stem" is the name
+	// without its extension, which is how audio appears, because the engine keeps
+	// the stem and the extension in separate strings and only joins them on the
+	// playback path. Saying which is which keeps the two from being confused, and
+	// makes it obvious that a stem hit has not yet been seen as a joined name.
+	logInfo("%s name=\"%s\" [%s] (%s)", prefix, text, archive.c_str(),
+		nameMatchKind(match));
 }
 
 using CompareFn = int(__cdecl*)(const char*, const char*);
@@ -823,8 +1190,9 @@ void reportCompareArgument(const char* value) {
 	}
 
 	std::string archive;
-	if (lookupEntryName((const uint8_t*)raw, len, archive)) {
-		reportConfirmedName("MATCH", (const uint8_t*)raw, len, archive);
+	NameMatch match = NameMatch::None;
+	if (lookupEntryName((const uint8_t*)raw, len, archive, &match)) {
+		reportConfirmedName("MATCH", (const uint8_t*)raw, len, archive, match);
 	}
 }
 
@@ -978,8 +1346,9 @@ void __cdecl onAssignString(const char* source) {
 
 			if (len >= 3) {
 				std::string archive;
-				if (lookupEntryName((const uint8_t*)raw, len, archive)) {
-					reportConfirmedName("MATCH", (const uint8_t*)raw, len, archive);
+				NameMatch match = NameMatch::None;
+				if (lookupEntryName((const uint8_t*)raw, len, archive, &match)) {
+					reportConfirmedName("MATCH", (const uint8_t*)raw, len, archive, match);
 				}
 			}
 		}
@@ -1277,7 +1646,177 @@ void installAssignStringHook() {
 			name == "CKiwiSoundEngine";
 	}
 
-	// Claim an (object, slot) pair for dumping. Returns true only the first time.
+	// How much of the object to read.
+//
+// The name was first found by a whole-object scan reporting "+0xF8", but that was a
+// buffer offset rather than a field offset: reading exactly from +0xF8 then produced
+// no name across 5811 samples, while a later confirmed live name turned up at +0x38
+// on another object of the same class. So there is no single offset to read, and
+// the whole prefix is scanned for a run that the entry index confirms -- which is
+// how the name was found in the first place, and cannot report a plausible wrong
+// name because a run that is not a real entry simply is not one.
+constexpr size_t kPlayerNameWindow = 256;
+
+// Last name reported per object, so a field that holds steady across thousands of
+// calls produces one line rather than one per call.
+//
+// Fixed-size open addressing keyed on the object pointer: this runs on audio
+// threads for every hooked call, so it must not allocate, take a lock, or grow.
+// Entries are invalidated by replacing the name, never removed, which keeps it
+// lock-free; a stale entry can only cause a missed first report, never a wrong one.
+constexpr size_t kLiveNameSlots = 512;
+
+struct LiveNameSlot {
+	uintptr_t object; // 0 = never used
+	uint32_t length;  // 0 = nothing recorded yet
+	uint64_t hash;
+};
+
+LiveNameSlot g_liveNameSlots[kLiveNameSlots];
+
+// Diagnostics: dump the whole object prefix on every sample, and count how many
+// samples read successfully. Together these distinguish "the field is not there"
+// from "the read is failing", which look identical from the outside.
+bool g_liveProbe = false;
+LONG g_liveReadOk = 0;
+LONG g_liveReadFailed = 0;
+LONG g_liveSamples = 0;
+LONG g_liveFound = 0;
+
+LiveNameSlot* liveNameSlot(uintptr_t object) {
+	// Fibonacci-style mixing, so objects that differ by a small stride -- which
+	// pooled allocations very often do -- do not all land on one slot.
+	const size_t index = (size_t)(((object >> 4) * 0x9E3779B1u) >> 22) %
+		kLiveNameSlots;
+	return &g_liveNameSlots[index];
+}
+
+// Read the name off an object and log it when it has changed.
+void reportLiveName(uintptr_t object, const std::string& className) {
+	if (object < 0x10000) {
+		return;
+	}
+
+	// Read the object prefix. Guarded, because `object` came from the game's own
+	// call and is arbitrary as far as this code is concerned.
+	uint8_t window[kPlayerNameWindow] = {};
+	InterlockedIncrement(&g_probing);
+	const bool read = safeReadMemory(window, object, sizeof(window));
+	InterlockedDecrement(&g_probing);
+	if (!read) {
+		InterlockedIncrement(&g_liveReadFailed);
+		return;
+	}
+	InterlockedIncrement(&g_liveReadOk);
+
+	if (g_liveProbe) {
+		InterlockedIncrement(&g_liveSamples);
+		char probe[1024];
+		int pn = snprintf(probe, sizeof(probe), "LIVE %p bytes:", (void*)object);
+		for (size_t k = 0; k < kPlayerNameWindow && pn > 0 &&
+			pn < (int)sizeof(probe) - 4; ++k) {
+			pn += snprintf(probe + pn, sizeof(probe) - (size_t)pn, " %02X",
+				window[k]);
+		}
+		logInfo("%s", probe);
+	}
+
+	// Scan the object for runs that are confirmed archive entries.
+	//
+	// The offset is not stable. Live names have been observed at +0x38, +0x50, +0x88
+	// and +0xF8 on the same class, so there is no single field to read and the buffer
+	// is searched instead.
+	//
+	// This runs on every hooked audio call, so it has to be cheap. It is: an object is
+	// mostly small integers and padding, and shiftJisRunLength rejects a non-text
+	// byte on its first test, so nearly every offset costs a single comparison. Only
+	// runs of three or more bytes reach the index lookup.
+	//
+	// The whole buffer is scanned rather than stopping at the first hit, because an
+	// object can hold more than one name: a player may reference both the sound it
+	// plays and the channel it is routed through.
+int foundOffset = -1;
+	int foundLength = 0;
+	std::string archive;
+	NameMatch match = NameMatch::None;
+	bool haveName = false;
+
+	for (size_t k = 0; k + 3 <= kPlayerNameWindow; ++k) {
+		const int len = shiftJisRunLength(window + k,
+			(int)(kPlayerNameWindow - k));
+		if (len < 3) {
+			continue;
+		}
+
+		std::string candidateArchive;
+		NameMatch candidateMatch = NameMatch::None;
+		if (!lookupEntryName(window + k, len, candidateArchive, &candidateMatch)) {
+			continue;
+		}
+
+		if (haveName) {
+			// A further name in the same object, tracked under its own slot so
+			// that it too is reported once rather than on every call.
+			const uint64_t extraHash = fnv1a(window + k, (size_t)len);
+			// Truncated deliberately: the x86 build this is compiled for has a
+			// 32-bit pointer, and folding in the low half of the hash is enough to
+			// separate the names an object holds. The value is only ever used as a
+			// table key, never dereferenced.
+			const uintptr_t extraKey = object ^ (uintptr_t)(extraHash & 0xFFFFFFFFu);
+			LiveNameSlot* extra = liveNameSlot(extraKey);
+			if (extra->object == extraKey && extra->length == (uint32_t)len &&
+				extra->hash == extraHash) {
+				continue;
+			}
+			extra->object = extraKey;
+			extra->length = (uint32_t)len;
+			extra->hash = extraHash;
+
+			char extraText[1024];
+			escapeToLog(extraText, sizeof(extraText), window + k, len);
+			logInfo("PLAY %p +0x%02X = \"%s\" [%s] (%s)", (void*)object, (int)k,
+				extraText, candidateArchive.c_str(), nameMatchKind(candidateMatch));
+			InterlockedIncrement(&g_liveFound);
+			continue;
+		}
+
+		foundOffset = (int)k;
+		foundLength = len;
+		archive = std::move(candidateArchive);
+		match = candidateMatch;
+		haveName = true;
+	}
+
+	if (!haveName) {
+		return;
+	}
+
+	// Compare against the last name reported for this object. The name itself is
+	// not kept -- only its hash and length -- so this stays a small fixed table and
+	// the comparison is cheap. Hash plus length is not proof of equality, so the
+	// bytes are re-read to confirm before reporting a change; a hash collision can
+	// therefore cost a missed line, never a wrong one.
+	const uint8_t* name = window + foundOffset;
+	const uint64_t hash = fnv1a(name, (size_t)foundLength);
+
+	LiveNameSlot* slot = liveNameSlot(object);
+	if (slot->object == object && slot->length == (uint32_t)foundLength &&
+		slot->hash == hash) {
+		return; // unchanged
+	}
+
+	char escaped[1024];
+	escapeToLog(escaped, sizeof(escaped), name, foundLength);
+	logInfo("PLAY %p +0x%02X = \"%s\" [%s] (%s)", (void*)object, foundOffset,
+		escaped, archive.c_str(), nameMatchKind(match));
+
+	slot->object = object;
+	slot->length = (uint32_t)foundLength;
+	slot->hash = hash;
+	InterlockedIncrement(&g_liveFound);
+}
+
+// Claim an (object, slot) pair for dumping. Returns true only the first time.
 	//
 	// Keyed on the slot as well as the object on purpose. Claiming once per object
 	// caught it during construction, when the memory still belonged to a previous
@@ -1618,38 +2157,60 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 
 			char raw[512];
 			InterlockedIncrement(&g_probing);
-
 			const int len = safeShiftJisRunLength(candidate, raw, (int)sizeof(raw) - 1);
-			if (len >= 3) {
-				std::string archive;
-				if (lookupEntryName((const uint8_t*)raw, len, archive)) {
-					reportConfirmedName("PLAY", (const uint8_t*)raw, len, archive);
-				}
-				else {
-					// Otherwise the name may be the tail of a path such as
-					// "EvenicleVoice/10001.opus"; retry on the last component.
-					int lastSlash = -1;
-					for (int i = 0; i < len; ++i) {
-						if (raw[i] == '/') {
-							lastSlash = i;
-						}
-					}
-					if (lastSlash >= 0) {
-						const uint8_t* tail = (const uint8_t*)raw + lastSlash + 1;
-						const int tailLen = len - lastSlash - 1;
-						if (tailLen >= 3 && lookupEntryName(tail, tailLen, archive)) {
-							reportConfirmedName("PLAY", tail, tailLen, archive);
-						}
-					}
-				}
+			InterlockedDecrement(&g_probing);
+
+			if (len < 3) {
+				continue;
 			}
 
-			InterlockedDecrement(&g_probing);
+			std::string archive;
+			NameMatch match = NameMatch::None;
+			if (lookupEntryName((const uint8_t*)raw, len, archive, &match)) {
+				reportConfirmedName("PLAY", (const uint8_t*)raw, len, archive, match);
+				continue;
+			}
+
+			// Otherwise the name may be the tail of a path such as
+			// "EvenicleVoice/10001.opus"; retry on the last component.
+			int lastSlash = -1;
+			for (int i = 0; i < len; ++i) {
+				if (raw[i] == '/') {
+					lastSlash = i;
+				}
+			}
+			if (lastSlash < 0) {
+				continue;
+			}
+
+			const uint8_t* tail = (const uint8_t*)raw + lastSlash + 1;
+			const int tailLen = len - lastSlash - 1;
+			if (tailLen >= 3 && lookupEntryName(tail, tailLen, archive, &match)) {
+				reportConfirmedName("PLAY", tail, tailLen, archive, match);
+			}
 		}
 	}
+	// The live playback name, read from the object that is playing it.
+	//
+	// This is the answer to "which file is playing now". CSoundPlayer carries the
+	// archive entry stem inline at +0xF8, and the field changes as playback moves
+	// between sounds: the same object was observed holding "24_4416" and later
+	// "80_4416". So a name is not something to be logged once at load time -- it is
+	// state on the object, and reporting it means reading that field and logging
+	// it when it changes.
+	//
+	// Audio never reaches the string hook: every audio name arrives during a
+	// four-second burst at start-up, in ascending archive order, and nothing at all
+	// afterwards. That burst is the engine enumerating its archive, not sounds
+	// playing. CG behaves differently and appears in real time because each image
+	// is loaded when it is shown. Reading the field is therefore the only place the
+	// live name exists.
+	if (g_liveNames) {
+		reportLiveName((uintptr_t)self, target.className);
+	}
+
 	// Object memory dumps are diagnosis only, and by far the largest thing the
-	// hook used to produce. The decoded sound object turned out not to carry the
-	// entry name at all, so this is off unless explicitly asked for.
+	// hook used to produce. Used to establish the layout above; now off by default.
 	if (!g_dumpObjects) {
 		return;
 	}
@@ -1717,12 +2278,13 @@ extern "C" void __stdcall AudioTrackerLogHook(void* self, void* sp0, void* sp1, 
 			}
 
 			std::string archive;
-			if (lookupEntryName(bytes + k, len, archive)) {
+			NameMatch match = NameMatch::None;
+			if (lookupEntryName(bytes + k, len, archive, &match)) {
 				char escaped[1024];
 				escapeToLog(escaped, sizeof(escaped), bytes + k, len);
-				logInfo("NAME %s %p +0x%02X len=%d = \"%s\"  [%s]",
+				logInfo("NAME %s %p +0x%02X len=%d = \"%s\"  [%s] (%s)",
 					dumpClass[i]->c_str(), dumpValue[i], k, len,
-					escaped, archive.c_str());
+					escaped, archive.c_str(), nameMatchKind(match));
 				++matches;
 			}
 
@@ -1779,6 +2341,7 @@ int AudioTracker::init() {
 		logInfo("AudioTracker: QUIET mode (counters only, no logging).");
 	}
 
+	g_liveProbe = envFlag(L"ALICE_SOUNDFETCHER_LIVEPROBE");
 	g_verbose = envFlag(L"ALICE_SOUNDFETCHER_VERBOSE");
 	g_dumpObjects = envFlag(L"ALICE_SOUNDFETCHER_DUMPOBJECTS");
 	g_hookComparisons = envFlag(L"ALICE_SOUNDFETCHER_COMPARES");
