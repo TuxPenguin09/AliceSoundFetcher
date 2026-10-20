@@ -84,6 +84,7 @@ int runTailMode(const fs::path& logPath) {
 //   classes = CSoundPlayer,CDirectSoundBuffer
 //   dumpObjects = 0
 //   hookComparisons = 0
+//   trace = 0
 //
 // A missing file, or a missing key, means "use the default".
 // ---------------------------------------------------------------------------
@@ -92,6 +93,7 @@ struct Settings {
 	bool verbose = false;
 	bool dumpObjects = false;
 	bool hookComparisons = false;
+	bool trace = false;
 	std::string classes;   // empty means the built-in list
 	std::string archives;  // empty means audio extensions only
 };
@@ -177,6 +179,8 @@ Settings loadSettings() {
 			settings.dumpObjects = parseBool(value, settings.dumpObjects);
 		} else if (key == "hookComparisons") {
 			settings.hookComparisons = parseBool(value, settings.hookComparisons);
+		} else if (key == "trace") {
+			settings.trace = parseBool(value, settings.trace);
 		} else if (key == "classes") {
 			settings.classes = value;
 		} else if (key == "archives") {
@@ -304,6 +308,12 @@ int main(int argc, char* argv[]) {
 		settings.dumpObjects ? L"1" : L"0");
 	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_COMPARES",
 		settings.hookComparisons ? L"1" : L"0");
+	SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_TRACE",
+		settings.trace ? L"1" : L"0");
+	if (settings.trace) {
+		std::cout << "config: sampling every audio call and logging the text it holds"
+			<< std::endl;
+	}
 	if (!settings.classes.empty()) {
 		const std::wstring wide(settings.classes.begin(), settings.classes.end());
 		SetEnvironmentVariableW(L"ALICE_SOUNDFETCHER_CLASSES", wide.c_str());
